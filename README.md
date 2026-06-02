@@ -20,7 +20,7 @@ Every 30 seconds, the engine builds a dynamic Graph Laplacian from live transit,
 
 | 3D Spectral Topology Visualization | Multimodal Gridlock Diagnostics HUD | Canary Fleet Command HUD |
 |:---:|:---:|:---:|
-| ![3D Spectral Topology](docs/screenshots/media__1780429164336.png) | ![Multimodal Diagnostics HUD](docs/screenshots/media__1780429193678.jpg) | ![Canary Fleet Command](docs/screenshots/media__1780429164260.png) |
+| ![3D Spectral Topology](docs/screenshots/media__1780429164336.png) | ![Multimodal Diagnostics HUD](docs/screenshots/media__1780429193678.jpg) | ![Canary Fleet Command](docs/screenshots/media__1780429190580.png) |
 
 ---
 
