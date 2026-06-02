@@ -586,7 +586,7 @@ async def poll_bikeshare_once(session, tree):
 
 async def poll_gtfs_rt_once(session):
     try:
-        async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-tripupdates.pb") as resp:
+        async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-tripupdates.pb", headers={"api_key": API_KEY}) as resp:
             if resp.status == 200:
                 content = await resp.read()
                 feed = gtfs_realtime_pb2.FeedMessage()
@@ -757,7 +757,7 @@ async def poll_rideon_tu_once(session):
 
 async def poll_alerts_once(session):
     try:
-        async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-alerts.pb") as resp:
+        async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-alerts.pb", headers={"api_key": API_KEY}) as resp:
             if resp.status == 200:
                 content = await resp.read()
                 feed = gtfs_realtime_pb2.FeedMessage()
@@ -777,7 +777,7 @@ async def poll_alerts_once(session):
 
 async def poll_vehicle_positions_once(session):
     try:
-        async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-vehiclepositions.pb") as resp:
+        async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-vehiclepositions.pb", headers={"api_key": API_KEY}) as resp:
             if resp.status == 200:
                 content = await resp.read()
                 feed = gtfs_realtime_pb2.FeedMessage()
@@ -867,7 +867,7 @@ async def poll_vehicle_positions_once(session):
 
 async def poll_metrorail_rt_once(session):
     try:
-        async with session.get("https://api.wmata.com/gtfs/rail-gtfsrt-alerts.pb") as resp:
+        async with session.get("https://api.wmata.com/gtfs/rail-gtfsrt-alerts.pb", headers={"api_key": API_KEY}) as resp:
             if resp.status == 200:
                 content = await resp.read()
                 feed = gtfs_realtime_pb2.FeedMessage()
@@ -898,7 +898,7 @@ except Exception as e:
 
 async def poll_rail_positions_once(session, tree, stops_info, nodes_list):
     try:
-        async with session.get("https://api.wmata.com/gtfs/rail-gtfsrt-vehiclepositions.pb") as resp:
+        async with session.get("https://api.wmata.com/gtfs/rail-gtfsrt-vehiclepositions.pb", headers={"api_key": API_KEY}) as resp:
             if resp.status == 200:
                 content = await resp.read()
                 feed = gtfs_realtime_pb2.FeedMessage()
