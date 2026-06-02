@@ -69,16 +69,16 @@ The E2E Test Suite is structured around a **4-Tier Test Design**:
 
 ### Tiers Breakdown
 - **Tier 1: Feature Coverage**: At least 5 tests per feature covering happy paths (25 tests total).
-- **Tier 2: Boundary & Corner Cases**: Limits, empty/invalid inputs, dropouts, rate limit checks (25 tests total).
+- **Tier 2: Boundary & Corner Cases**: Limits, empty/invalid inputs, dropouts, rate limit checks (32 tests total).
 - **Tier 3: Cross-Feature Combinations**: Pairwise coverage of major feature interactions (5 tests total).
 - **Tier 4: Real-World Application Scenarios**: Multimodal transit use cases, routing shifts, and offline resilience (5 tests total).
 
 ---
 
 ## 4. Coverage Thresholds
-- **Total Test Cases**: 60 E2E and unit tests.
+- **Total Test Cases**: 67 E2E and unit tests.
 - **Pass Rate**: 100% required.
-- **Execution Speed**: $< 1.0$ seconds for all 60 tests to encourage pre-commit runs.
+- **Execution Speed**: $< 1.0$ seconds for all 67 tests to encourage pre-commit runs.
 - **External Network Dependence**: 0 HTTP requests.
 
 ---
