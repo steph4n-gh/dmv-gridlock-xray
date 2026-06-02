@@ -647,3 +647,30 @@ When the network connectivity falls below the critical threshold $\lambda_2 < 0.
     To prevent singularity collapses in the sparse eigensolver `eigsh` when extreme roadway delays decrease edge weights near zero, a rigid physical clamp floor is enforced on the friction matrix scale:
     $$\text{friction\_scale} = \max\left( \text{friction\_scale}, 0.01 \right)$$
     preserving the positive definiteness of the shifted operator $L - 10^{-5} I$.
+
+---
+
+## 10. Feed Extension & Mathematical Graph Laplacian Calculation
+To allow DMV Gridlock X-Ray to ingest new dynamic data feeds and sensors, developers can extend the core data ingestion loop and adjust the system's dynamic edge weight scaling. The detailed step-by-step guidelines for implementing these changes are documented in the developer guide: [docs/extending_feeds.md](docs/extending_feeds.md).
+
+### A. Graph Laplacian Formulation & Edge Weight Scaling
+The base topological structure of the Washington D.C. metropolitan transit network is modeled as a static topological mask $W_{\text{mask}} \in \{0, 1\}^{N \times N}$, representing the scheduled transit lines. When dynamic sensors or feeds are registered (such as vehicle velocities, bikeshare status, weather, or municipal incident feeds), they map to stop-level friction penalties $f_i \in [0.01, 1.0]$.
+
+The weighted adjacency matrix $W$ is dynamically constructed via symmetric scaling:
+$$W = \text{diag}(f) \cdot W_{\text{mask}} \cdot \text{diag}(f)$$
+
+Which evaluates to element-wise edge scaling:
+$$W_{ij} = f_i \cdot W_{\text{mask}, ij} \cdot f_j$$
+
+Here, $f_i$ represents the dynamic friction score at node $i$, clamped to a physical floor $f_i \ge 0.01$ to ensure numerical stability. The Graph Laplacian $L$ is then formulated as:
+$$L = D - W$$
+
+Where the diagonal degree entries $D_{ii}$ are computed dynamically:
+$$D_{ii} = \sum_{j} W_{ij}$$
+
+### B. Algebraic Connectivity & Numerical Solver Steps
+For any topology changes (e.g., adding or removing nodes or edge types), the dimensions of the sparse Graph Laplacian automatically adjust. The algebraic connectivity $\lambda_2$ (the Fiedler value) is solved using the shifted sparse eigensolver:
+$$(L - \sigma I) \vec{v} = (\lambda - \sigma) \vec{v}$$
+
+with stability shift $\sigma = 10^{-5}$. The lowest non-trivial eigenvalue $\lambda_2$ and its associated eigenvector $\vec{v}_2$ are extracted using `scipy.sparse.linalg.eigsh` to partition the network and repulse 3D elevations. For more information, refer to [docs/extending_feeds.md](docs/extending_feeds.md).
+

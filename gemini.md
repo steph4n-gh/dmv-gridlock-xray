@@ -5,7 +5,7 @@ Welcome, Antigravity/Gemini developer. This file defines the core standards, eng
 ---
 
 ## 1. The Post-Sprint Documentation Mandate (CRITICAL)
-After **each and every sprint**, feature addition, or optimization cycle, you **MUST** update and extend the codebase documentation in [ARCHITECTURE.md](file:///Volumes/Storage/wmataworkspace/bustracker/ARCHITECTURE.md) to match the standard set in the May 2026 mathematical audit.
+After **each and every sprint**, feature addition, or optimization cycle, you **MUST** update and extend the codebase documentation in [ARCHITECTURE.md](ARCHITECTURE.md) to match the standard set in the May 2026 mathematical audit.
 
 Your documentation must be:
 *   **Exceptional & Highly Comprehensive**: Avoid high-level hand-waving or generic descriptions. Write with extreme technical rigor.
@@ -16,7 +16,7 @@ Your documentation must be:
 ---
 
 ## 2. Ingested Input Registry ("For & Why" Standard)
-Every data feed ingested by `engine.py` (e.g., GTFS-RT, GBFS, REST GeoJSON, weather forecasts) must be meticulously logged and explained in [ARCHITECTURE.md](file:///Volumes/Storage/wmataworkspace/bustracker/ARCHITECTURE.md) under the following schema:
+Every data feed ingested by `engine.py` (e.g., GTFS-RT, GBFS, REST GeoJSON, weather forecasts) must be meticulously logged and explained in [ARCHITECTURE.md](ARCHITECTURE.md) under the following schema:
 1.  **Protocol & Frequency**: Document the data transfer format (e.g., Protocol Buffers `.pb`, JSON REST, Web Mercator GeoJSON) and polling cycle duration.
 2.  **Key Fields Parsed**: List the exact variables, keys, and objects extracted from the raw payload.
 3.  **Physical Phenomenon**: Define what real-world state or urban event this represents.
@@ -25,7 +25,7 @@ Every data feed ingested by `engine.py` (e.g., GTFS-RT, GBFS, REST GeoJSON, weat
 ---
 
 ## 3. Telemetry & GUI Output Registry ("What & Why" Standard)
-Every metric, visualization, panel, or widget displayed on the dashboard interface (`index.html`) or logged by the engine must be meticulously logged and explained in [ARCHITECTURE.md](file:///Volumes/Storage/wmataworkspace/bustracker/ARCHITECTURE.md) under the following schema:
+Every metric, visualization, panel, or widget displayed on the dashboard interface (`index.html`) or logged by the engine must be meticulously logged and explained in [ARCHITECTURE.md](ARCHITECTURE.md) under the following schema:
 1.  **What it Displays**: The visual formatting, units of measurement, or ranges shown.
 2.  **Why it is Displayed**: The mathematical calculation, underlying equations, active variables, and physical scaling factors.
 3.  **Operational Utility**: Explain exactly how a metropolitan transit dispatcher or municipal planner utilizes this telemetry to make real-time operational decisions.

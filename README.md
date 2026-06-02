@@ -1,10 +1,29 @@
 # DMV Gridlock X-Ray 📡🚇🚌
 
+<p align="center">
+  <img src="docs/screenshots/logo.png" alt="DMV Gridlock X-Ray Logo" width="500" />
+</p>
+
 DMV Gridlock X-Ray is a real-time mathematical topology engine and 3D visualization command dashboard for the Washington D.C. metropolitan transit network (WMATA and Montgomery County RideOn). Rather than plotting vehicle locations as static markers, it models the entire transit grid as a live **sparse mathematical matrix**, computing systemic congestion and network fractures using Spectral Graph Theory.
 
 Every 30 seconds, the engine builds a dynamic Graph Laplacian from live transit, weather, incident, and micro-mobility feeds, calculating the network's algebraic connectivity ($\lambda_2$, the "Fiedler value"). This allows dispatchers to detect and route around structural gridlock minutes before human operators issue official bulletins.
 
 ---
+
+## 🔬 Project Research Status
+
+> **Note**: DMV Gridlock X-Ray is an **experimental research project** investigating the application of Spectral Graph Theory, sparse linear algebra, and Graph Heat Diffusion Kernels to real-time municipal public transit networks. It acts as an active proof-of-concept modeling DMV transit grids as a live, friction-scaled Graph Laplacian, and is not an officially endorsed service of the WMATA or Montgomery County transit authorities.
+
+---
+
+## 📊 Dashboard Preview
+
+| 3D Spectral Topology Visualization | Multimodal Gridlock Diagnostics HUD | Canary Fleet Command HUD |
+|:---:|:---:|:---:|
+| ![3D Spectral Topology](docs/screenshots/media__1780429164336.png) | ![Multimodal Diagnostics HUD](docs/screenshots/media__1780429193678.jpg) | ![Canary Fleet Command](docs/screenshots/media__1780429164260.png) |
+
+---
+
 
 ## 🚀 Key Features
 
@@ -75,13 +94,24 @@ Install the required scientific computing, web, and rendering dependencies:
 pip install -r requirements.txt
 ```
 
-### 3. Configure API Credentials
-Export your API credentials as environment variables:
+### 3. Configure API Credentials & Environment Variables
+To enable real-time ingestion of vehicle positions, route delays, and service alerts, you must configure the following environment variables. Export them before running the backend processing engine:
+*   `WMATA_API_KEY`: Developer key acquired from [developer.wmata.com](https://developer.wmata.com) to access the WMATA GTFS-RT Protobuf streams and Metrobus/Metrorail telemetry APIs.
+*   `RIDEON_API_KEY`: Montgomery County API key to authenticate and query RideOn Bus GPS vehicle positions and trip updates JSON endpoints.
+*   `RIDEON_CLIENT_ID`: Montgomery County Developer Portal client ID required in standard HTTP header payloads alongside `RIDEON_API_KEY`.
+
 ```bash
 export WMATA_API_KEY="your_developer_key_here"
 export RIDEON_API_KEY="your_rideon_api_key_here"
 export RIDEON_CLIENT_ID="your_rideon_client_id_here"
 ```
+
+### 4. Automatic Static GTFS Management
+The application manages static GTFS schedule topology automatically on startup. During the initialization phase, the engine checks for the existence of the static GTFS files in:
+*   `gtfs/wmata/`
+*   `gtfs/rideon/`
+
+If these files are missing or incomplete, the application will automatically download, extract, and compile the base topological road and rail graph files. **No manual download or extraction of static GTFS ZIP archives is required.**
 
 ---
 
@@ -137,3 +167,9 @@ Once both processes are active, navigate to **`http://localhost:8501`** in your 
 *   **Path**: `/api/clear`
 *   **Method**: `POST`
 *   **Description**: Removes all injected simulation failures and restores baseline graph tracking.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
