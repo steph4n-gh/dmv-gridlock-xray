@@ -1,0 +1,14 @@
+mlx
+networkx
+pandas
+requests
+protobuf
+gtfs-realtime-bindings
+numpy
+scipy
+aiohttp
+streamlit
+plotly
+pyarrow
+streamlit-autorefresh
+pydeck

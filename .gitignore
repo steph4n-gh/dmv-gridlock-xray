@@ -1,0 +1,47 @@
+# Python caches and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# DMV Gridlock X-Ray State cache & metrics logs
+network_state.npz
+network_state.npz.tmp.npz
+network_state_tmp.npz
+prediction_scoreboard.csv
+telemetry_history.csv
+sim_state.json
+rate_limit_state.json
+server.log
+
+# Live visualization outputs
+static/live_data.json
+static/manifest.json
+static/stops_list.json
+static/history/
+
+# Static GTFS data feeds (fused at startup)
+gtfs/
+
+# Logs and runtime outputs
+*.log
+server.log
+
+# Streamlit config/cache
+.streamlit/
+
+# Subagent state and agent workspaces
+.agents/
+
+# Temporary scratch scripts and debug files
+scratch/
+scratch_rail.py

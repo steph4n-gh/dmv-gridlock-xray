@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+    <style>
+        body { margin: 0; padding: 0; background-color: #111111; overflow: hidden; }
+        #tester { width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+    <div id="tester"></div>
+    <script>
+        const TESTER = document.getElementById('tester');
+        const DC_LON = -77.0369;
+        const DC_LAT = 38.9072;
+
+        let isInitialized = false;
+
+        async function updateMap() {
+            try {
+                // Add timestamp to prevent browser caching
+                const response = await fetch('live_data.json?t=' + new Date().getTime());
+                const data = await response.json();
+
+                const traces = [
+                    // 0: Ground Plane
+                    {
+                        x: data.gx, y: data.gy, z: data.gz,
+                        mode: 'markers', marker: {size: 1.5, color: 'rgba(50,50,50,0.3)'},
+                        type: 'scatter3d', hoverinfo: 'none', name: 'Ground Plane'
+                    },
+                    // 1: Connectivity Web
+                    // Wait, we didn't export the web in JSON because it's too big and static. 
+                    // Let's check engine.py. Ah, we didn't export ex, ey, ez!
+                    // I need to add ex, ey, ez to engine.py export. 
+                    // Actually, if we don't have the web, let's just render fractures and nodes first to verify it works.
+                ];
+
+                // 1: Active Fractures (Core)
+                if (data.fx.length > 0) {
+                    traces.push({
+                        x: data.fx, y: data.fy, z: data.fz,
+                        mode: 'lines', line: {color: 'rgba(255, 0, 85, 0.9)', width: 4},
+                        type: 'scatter3d', name: 'Gridlock Core'
+                    });
+                    // Halo
+                    traces.push({
+                        x: data.fx, y: data.fy, z: data.fz,
+                        mode: 'lines', line: {color: 'rgba(255, 0, 85, 0.2)', width: 12},
+                        type: 'scatter3d', name: 'Spectral Tear', hoverinfo: 'none'
+                    });
+                } else {
+                    traces.push({x: [DC_LON], y: [DC_LAT], z: [0], mode: 'lines', line: {width:0}, type:'scatter3d', name: 'Gridlock Core'});
+                    traces.push({x: [DC_LON], y: [DC_LAT], z: [0], mode: 'lines', line: {width:0}, type:'scatter3d', name: 'Spectral Tear'});
+                }
+
+                // Clear Nodes
+                if (data.cx.length > 0) {
+                    traces.push({
+                        x: data.cx, y: data.cy, z: data.cz,
+                        mode: 'markers', marker: {size: 2, color: 'rgba(0, 255, 100, 0.15)'},
+                        type: 'scatter3d', text: data.ctxt, hoverinfo: 'text', name: 'Clear Flow'
+                    });
+                } else {
+                    traces.push({x: [DC_LON], y: [DC_LAT], z: [0], mode: 'markers', marker: {size:0, color:'rgba(0,0,0,0)'}, type:'scatter3d', name:'Clear Flow'});
+                }
+
+                // Jammed Hubs
+                if (data.jx.length > 0) {
+                    traces.push({
+                        x: data.jx, y: data.jy, z: data.jz,
+                        mode: 'markers',
+                        marker: {
+                            size: data.jsiz,
+                            color: data.jcol,
+                            colorscale: [[0.0, 'red'], [1.0, 'yellow']],
+                            cmin: 0.0, cmax: 0.85,
+                            opacity: 1.0, line: {color: 'white', width: 1},
+                            colorbar: {title: "Jammed Flow", thickness: 15, x: 1.05}
+                        },
+                        type: 'scatter3d', text: data.jtxt, hoverinfo: 'text', name: 'Jammed Hubs'
+                    });
+                } else {
+                    traces.push({x: [DC_LON], y: [DC_LAT], z: [0], mode: 'markers', marker: {size:0, color:'rgba(0,0,0,0)'}, type:'scatter3d', name:'Jammed Hubs'});
+                }
+
+                // Bikeshare
+                if (data.bx.length > 0) {
+                    traces.push({
+                        x: data.bx, y: data.by, z: data.bz,
+                        mode: 'markers', marker: {size: 12, color: 'white', symbol: 'circle-open', line: {color: 'white', width: 2.5}},
+                        type: 'scatter3d', name: 'Bikeshare Depletion', hoverinfo: 'none'
+                    });
+                } else {
+                    traces.push({x: [DC_LON], y: [DC_LAT], z: [0], mode: 'markers', marker: {size:0, color:'rgba(0,0,0,0)'}, type:'scatter3d', name:'Bikeshare Depletion'});
+                }
+
+                const layout = {
+                    scene: {
+                        xaxis: {title: 'Lon', backgroundcolor: "black", showgrid: false, zeroline: false},
+                        yaxis: {title: 'Lat', backgroundcolor: "black", showgrid: false, zeroline: false},
+                        zaxis: {title: 'Isolation', backgroundcolor: "black", showgrid: false, zeroline: false},
+                        aspectmode: 'manual', aspectratio: {x: 1, y: 1, z: 0.4}
+                    },
+                    margin: {r: 0, l: 0, b: 0, t: 0},
+                    paper_bgcolor: '#111111',
+                    plot_bgcolor: '#111111',
+                    font: {color: 'white'},
+                    showlegend: true,
+                    legend: {yanchor: "top", y: 0.99, xanchor: "left", x: 0.01, bgcolor: "rgba(0,0,0,0.5)"}
+                };
+
+                Plotly.react(TESTER, traces, layout);
+            } catch (e) {
+                console.error("Data sync error:", e);
+            }
+        }
+
+        // Poll every 5 seconds
+        setInterval(updateMap, 5000);
+        updateMap();
+    </script>
+</body>
+</html>

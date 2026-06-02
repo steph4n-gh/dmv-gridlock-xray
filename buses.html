@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚌 DMV Canary Bus Control - Master HUD</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0e1117;
+            --bg-card: #161a23;
+            --bg-input: #202635;
+            --cyan: #00f2ff;
+            --green: #00ff88;
+            --yellow: #ffcc00;
+            --red: #ff0055;
+            --text-main: #fafafa;
+            --text-muted: #8b9bb4;
+            --border: #2d3548;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-main);
+            padding: 30px;
+            min-height: 100vh;
+        }
+
+        h1, h2, h3, .hud-title {
+            font-family: 'Outfit', sans-serif;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 20px;
+        }
+
+        .header-title-sec {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .logo-icon {
+            font-size: 2.2rem;
+        }
+
+        .logo-text h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--cyan), var(--green));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .logo-text p {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            letter-spacing: 0.5px;
+        }
+
+        .back-btn {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 20px;
+            background: rgba(0, 242, 255, 0.08);
+            border: 1px solid rgba(0, 242, 255, 0.25);
+            border-radius: 6px;
+            color: var(--cyan);
+            font-weight: 600;
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+            box-shadow: 0 0 10px rgba(0, 242, 255, 0.05);
+        }
+
+        .back-btn:hover {
+            background: rgba(0, 242, 255, 0.15);
+            box-shadow: 0 0 15px rgba(0, 242, 255, 0.15);
+            transform: translateY(-1px);
+        }
+
+        /* Top HUD Cards */
+        .hud-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .hud-card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+            transition: transform 0.2s, border-color 0.2s;
+        }
+
+        .hud-card:hover {
+            transform: translateY(-2px);
+        }
+
+        .hud-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 3px;
+            background: var(--border);
+        }
+
+        .card-cyan::before { background: var(--cyan); }
+        .card-green::before { background: var(--green); }
+        .card-yellow::before { background: var(--yellow); }
+        .card-red::before { background: var(--red); }
+        .card-purple::before { background: #9900ff; }
+
+        .card-title {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+
+        .card-value {
+            font-size: 2.2rem;
+            font-weight: 700;
+            font-family: 'Outfit', sans-serif;
+            line-height: 1.1;
+        }
+
+        .card-value-unit {
+            font-size: 1rem;
+            font-weight: 500;
+            color: var(--text-muted);
+        }
+
+        .card-sub {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-top: 8px;
+        }
+
+        /* Leaderboards */
+        .lead-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 35px;
+        }
+
+        .lead-card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 15px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .lead-header {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            font-weight: bold;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .lead-body {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .lead-info h3 {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: var(--text-main);
+        }
+
+        .lead-info p {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .lead-stat {
+            font-size: 1.4rem;
+            font-weight: 700;
+            font-family: 'Outfit', sans-serif;
+            text-align: right;
+        }
+
+        /* Search and Filter Panel */
+        .control-panel {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 25px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .search-container {
+            flex: 2;
+            min-width: 250px;
+            position: relative;
+        }
+
+        .search-container input {
+            width: 100%;
+            padding: 10px 15px 10px 40px;
+            background-color: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: white;
+            font-size: 0.9rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .search-container input:focus {
+            border-color: var(--cyan);
+        }
+
+        .search-icon {
+            position: absolute;
+            left: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-muted);
+            font-size: 1rem;
+        }
+
+        .filter-select {
+            padding: 10px 15px;
+            background-color: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: white;
+            font-size: 0.9rem;
+            outline: none;
+            cursor: pointer;
+            min-width: 150px;
+            transition: border-color 0.2s;
+        }
+
+        .filter-select:focus {
+            border-color: var(--cyan);
+        }
+
+        .reset-btn {
+            padding: 10px 15px;
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .reset-btn:hover {
+            color: white;
+            border-color: white;
+        }
+
+        /* Master Table */
+        .table-container {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 0.9rem;
+        }
+
+        th {
+            background-color: rgba(22, 26, 35, 0.95);
+            color: var(--text-muted);
+            font-weight: 600;
+            padding: 15px 20px;
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid var(--border);
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+            transition: color 0.2s;
+        }
+
+        th:hover {
+            color: white;
+        }
+
+        th.sort-active::after {
+            content: ' ▾';
+            position: absolute;
+            right: 8px;
+        }
+        th.sort-active.sort-asc::after {
+            content: ' ▴';
+        }
+
+        td {
+            padding: 14px 20px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: middle;
+            color: var(--text-main);
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover td {
+            background-color: rgba(255, 255, 255, 0.02);
+        }
+
+        /* Custom cell styles */
+        .bus-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-weight: 600;
+            color: var(--text-main);
+        }
+
+        .route-pill {
+            display: inline-block;
+            padding: 3px 10px;
+            background: rgba(0, 242, 255, 0.1);
+            border: 1px solid rgba(0, 242, 255, 0.2);
+            color: var(--cyan);
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            text-align: center;
+        }
+
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .dot-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .status-moving { color: var(--green); }
+        .status-moving .dot-indicator { background-color: var(--green); box-shadow: 0 0 6px var(--green); }
+        
+        .status-halted { color: var(--yellow); }
+        .status-halted .dot-indicator { background-color: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+        
+        .status-late { color: var(--red); }
+        .status-late .dot-indicator { background-color: var(--red); box-shadow: 0 0 6px var(--red); }
+
+        .delay-early { color: var(--cyan); font-weight: 600; }
+        .delay-ontime { color: var(--green); }
+        .delay-late { color: var(--red); font-weight: 600; }
+
+        .track-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 5px 12px;
+            background-color: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            color: var(--text-main);
+            text-decoration: none;
+            font-size: 0.8rem;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+
+        .track-link:hover {
+            border-color: var(--cyan);
+            color: var(--cyan);
+            background-color: rgba(0, 242, 255, 0.05);
+        }
+
+        .empty-state {
+            padding: 40px;
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 1rem;
+        }
+
+        .pulse-light {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background-color: var(--green);
+            box-shadow: 0 0 8px var(--green);
+            animation: pulse-glow 1.5s infinite alternate;
+        }
+
+        @keyframes pulse-glow {
+            0% { transform: scale(0.9); opacity: 0.6; }
+            100% { transform: scale(1.1); opacity: 1; }
+        }
+
+        .sync-sec {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="header-title-sec">
+            <span class="logo-icon">🚌</span>
+            <div class="logo-text">
+                <h1>CANARY FLEET COMMAND</h1>
+                <p>DMV Metrobus Live Diagnostic & Analytics Console</p>
+            </div>
+        </div>
+        <div style="display: flex; align-items: center; gap: 20px;">
+            <div class="sync-sec">
+                <div class="pulse-light" id="pulse-indicator"></div>
+                <span id="sync-status">SYNCED LIVE</span>
+            </div>
+            <a href="trains.html" class="back-btn" style="background: rgba(255, 0, 85, 0.08); border-color: rgba(255, 0, 85, 0.25); color: var(--red); box-shadow: 0 0 10px rgba(255, 0, 85, 0.05); margin-right: 10px;">🚇 Master Rail HUD</a>
+            <a href="index.html" class="back-btn">🗺️ Visual Matrix Map</a>
+        </div>
+    </header>
+
+    <!-- Top HUD Cards -->
+    <section class="hud-grid">
+        <div class="hud-card card-cyan">
+            <div class="card-title">Canary Fleet Count</div>
+            <div class="card-value" id="hud-total">--</div>
+            <div class="card-sub" id="hud-sub-total">Active trackable vehicles</div>
+        </div>
+        <div class="hud-card card-green">
+            <div class="card-title">Fleet Avg Speed</div>
+            <div class="card-value" id="hud-speed">-- <span class="card-value-unit">mph</span></div>
+            <div class="card-sub" id="hud-sub-speed">Excluding stationary halts</div>
+        </div>
+        <div class="hud-card card-yellow">
+            <div class="card-title">Halted Canaries</div>
+            <div class="card-value" id="hud-halted">--</div>
+            <div class="card-sub" id="hud-sub-halted">Stationary or slow vehicles</div>
+        </div>
+        <div class="hud-card card-red">
+            <div class="card-title">Delayed Buses</div>
+            <div class="card-value" id="hud-delayed">--</div>
+            <div class="card-sub" id="hud-sub-delayed">Buses delayed > 1 min</div>
+        </div>
+        <div class="hud-card card-purple">
+            <div class="card-title">Active Routes</div>
+            <div class="card-value" id="hud-routes">--</div>
+            <div class="card-sub" id="hud-sub-routes">Unique corridors monitored</div>
+        </div>
+    </section>
+
+    <!-- Leaderboards -->
+    <section class="lead-grid">
+        <!-- Speed King -->
+        <div class="lead-card" style="border-left: 3px solid var(--red);">
+            <div class="lead-header">
+                <span>⚡ Canary Speed King</span>
+                <span style="color: var(--red); font-weight: bold;">FASTEST</span>
+            </div>
+            <div class="lead-body">
+                <div class="lead-info">
+                    <h3 id="king-title">None</h3>
+                    <p id="king-sub">Waiting for update...</p>
+                </div>
+                <div class="lead-stat" id="king-stat" style="color: var(--red);">-- mph</div>
+            </div>
+        </div>
+
+        <!-- Speed Snail -->
+        <div class="lead-card" style="border-left: 3px solid var(--yellow);">
+            <div class="lead-header">
+                <span>🐌 Active Snail</span>
+                <span style="color: var(--yellow); font-weight: bold;">SLOWEST MOVING</span>
+            </div>
+            <div class="lead-body">
+                <div class="lead-info">
+                    <h3 id="snail-title">None</h3>
+                    <p id="snail-sub">Waiting for update...</p>
+                </div>
+                <div class="lead-stat" id="snail-stat" style="color: var(--yellow);">-- mph</div>
+            </div>
+        </div>
+
+        <!-- Congestion Victim -->
+        <div class="lead-card" style="border-left: 3px solid var(--red);">
+            <div class="lead-header">
+                <span>🚨 Gridlock Victim</span>
+                <span style="color: var(--red); font-weight: bold;">MOST DELAYED</span>
+            </div>
+            <div class="lead-body">
+                <div class="lead-info">
+                    <h3 id="victim-title">None</h3>
+                    <p id="victim-sub">Waiting for update...</p>
+                </div>
+                <div class="lead-stat" id="victim-stat" style="color: var(--red);">-- min</div>
+            </div>
+        </div>
+
+        <!-- On-Time Champion -->
+        <div class="lead-card" style="border-left: 3px solid var(--green);">
+            <div class="lead-header">
+                <span>🏆 Schedule Champion</span>
+                <span style="color: var(--green); font-weight: bold;">ON-TIME</span>
+            </div>
+            <div class="lead-body">
+                <div class="lead-info">
+                    <h3 id="champion-title">None</h3>
+                    <p id="champion-sub">Waiting for update...</p>
+                </div>
+                <div class="lead-stat" id="champion-stat" style="color: var(--green);">-- min</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Search / Filter controls -->
+    <section class="control-panel">
+        <div class="search-container">
+            <span class="search-icon">🔍</span>
+            <input type="text" id="search-input" placeholder="Search by Bus ID, Route, Trip ID, status...">
+        </div>
+        <select id="route-filter" class="filter-select">
+            <option value="ALL">All Routes</option>
+        </select>
+        <select id="status-filter" class="filter-select">
+            <option value="ALL">All Statuses</option>
+            <option value="MOVING">Moving (> 2 mph)</option>
+            <option value="HALTED">Halted (≤ 2 mph)</option>
+            <option value="LATE">Delayed (> 60s)</option>
+        </select>
+        <button id="reset-filters" class="reset-btn">Reset Filters</button>
+    </section>
+
+    <!-- Master Table -->
+    <section class="table-container">
+        <table id="bus-table">
+            <thead>
+                <tr>
+                    <th id="th-id" class="sort-active" onclick="handleSort('id')">Bus ID</th>
+                    <th id="th-route" onclick="handleSort('route')">Route</th>
+                    <th id="th-speed" onclick="handleSort('speed')">Speed</th>
+                    <th id="th-delay" onclick="handleSort('delay')">Schedule Delay</th>
+                    <th id="th-status" onclick="handleSort('status')">Operational Status</th>
+                    <th id="th-bearing" onclick="handleSort('bearing')">Bearing</th>
+                    <th>Trip ID</th>
+                    <th style="text-align: right;">Action</th>
+                </tr>
+            </thead>
+            <tbody id="bus-tbody">
+                <tr>
+                    <td colspan="8" class="empty-state">Ingesting Metrobus telemetry, please stand by...</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+
+    <script>
+        let buses = [];
+        let filteredBuses = [];
+        let routesList = [];
+        
+        let searchQuery = "";
+        let routeFilter = "ALL";
+        let statusFilter = "ALL";
+        
+        let sortCol = "id";
+        let sortAsc = true;
+        
+        const tbody = document.getElementById('bus-tbody');
+        const rSelect = document.getElementById('route-filter');
+        const sSelect = document.getElementById('status-filter');
+        const searchInput = document.getElementById('search-input');
+        const resetBtn = document.getElementById('reset-filters');
+        
+        const totalHUD = document.getElementById('hud-total');
+        const speedHUD = document.getElementById('hud-speed');
+        const haltedHUD = document.getElementById('hud-halted');
+        const delayedHUD = document.getElementById('hud-delayed');
+        const routesHUD = document.getElementById('hud-routes');
+        
+        const syncStatus = document.getElementById('sync-status');
+        const pulseIndicator = document.getElementById('pulse-indicator');
+
+        // Leaderboard elements
+        const kingTitle = document.getElementById('king-title');
+        const kingSub = document.getElementById('king-sub');
+        const kingStat = document.getElementById('king-stat');
+        
+        const snailTitle = document.getElementById('snail-title');
+        const snailSub = document.getElementById('snail-sub');
+        const snailStat = document.getElementById('snail-stat');
+        
+        const victimTitle = document.getElementById('victim-title');
+        const victimSub = document.getElementById('victim-sub');
+        const victimStat = document.getElementById('victim-stat');
+        
+        const championTitle = document.getElementById('champion-title');
+        const championSub = document.getElementById('champion-sub');
+        const championStat = document.getElementById('champion-stat');
+
+        async function fetchLiveBuses() {
+            try {
+                const response = await fetch('static/live_data.json?t=' + new Date().getTime());
+                if (!response.ok) throw new Error("Offline");
+                const data = await response.json();
+                
+                buses = data.buses || [];
+                
+                // Track routes
+                const currentRoutes = [...new Set(buses.map(b => b.route))].sort();
+                updateRouteDropdown(currentRoutes);
+                
+                updateHUD();
+                updateLeaderboards();
+                applyFiltersAndRender();
+                
+                // Live blink
+                pulseIndicator.style.backgroundColor = '#00ff88';
+                pulseIndicator.style.boxShadow = '0 0 8px #00ff88';
+                syncStatus.innerText = `SYNCED LIVE (Cycle #${data.cycle})`;
+            } catch (err) {
+                console.error("Scraper connection offline", err);
+                pulseIndicator.style.backgroundColor = '#ff0055';
+                pulseIndicator.style.boxShadow = '0 0 8px #ff0055';
+                syncStatus.innerText = "SCRAPER OFFLINE";
+            }
+        }
+
+        function updateRouteDropdown(routes) {
+            if (routes.length === routesList.length && routes.every((r, idx) => r === routesList[idx])) return;
+            routesList = routes;
+            
+            const currentSelection = rSelect.value;
+            let html = '<option value="ALL">All Routes</option>';
+            routes.forEach(r => {
+                html += `<option value="${r}">Route ${r}</option>`;
+            });
+            rSelect.innerHTML = html;
+            rSelect.value = currentSelection in routes ? currentSelection : "ALL";
+        }
+
+        function updateHUD() {
+            if (buses.length === 0) {
+                totalHUD.innerText = "0";
+                speedHUD.innerText = "0.0 mph";
+                haltedHUD.innerText = "0";
+                delayedHUD.innerText = "0";
+                routesHUD.innerText = "0";
+                return;
+            }
+            
+            let total = buses.length;
+            let speedSum = 0;
+            let speedCount = 0;
+            let halted = 0;
+            let delayed = 0;
+            let routesSet = new Set();
+            
+            buses.forEach(b => {
+                routesSet.add(b.route);
+                let speedMph = b.speed * 2.23694;
+                if (speedMph < 2.0) {
+                    halted++;
+                } else {
+                    speedSum += speedMph;
+                    speedCount++;
+                }
+                
+                if (b.delay && b.delay > 60) {
+                    delayed++;
+                }
+            });
+            
+            let avgSpeed = speedCount > 0 ? (speedSum / speedCount).toFixed(1) : "0.0";
+            
+            totalHUD.innerText = total;
+            speedHUD.innerHTML = `${avgSpeed} <span class="card-value-unit">mph</span>`;
+            haltedHUD.innerText = halted;
+            delayedHUD.innerText = delayed;
+            routesHUD.innerText = routesSet.size;
+        }
+
+        function updateLeaderboards() {
+            if (buses.length === 0) return;
+            
+            let fastest = null;
+            let slowestMoving = null;
+            let mostDelayed = null;
+            let bestOnTime = null; // earliest or exactly on time
+            
+            buses.forEach(b => {
+                let speedMph = b.speed * 2.23694;
+                
+                // Fastest
+                if (!fastest || speedMph > (fastest.speed * 2.23694)) {
+                    fastest = b;
+                }
+                
+                // Slowest moving (> 0.2 mph and < 6.0 mph)
+                if (speedMph > 0.2 && speedMph < 6.0) {
+                    if (!slowestMoving || speedMph < (slowestMoving.speed * 2.23694)) {
+                        slowestMoving = b;
+                    }
+                }
+                
+                // Most Delayed (highest delay > 0)
+                if (b.delay !== undefined && b.delay > 0) {
+                    if (!mostDelayed || b.delay > mostDelayed.delay) {
+                        mostDelayed = b;
+                    }
+                }
+                
+                // Schedule Champion (delay closest to 0 or negative)
+                if (b.delay !== undefined) {
+                    if (!bestOnTime || b.delay < bestOnTime.delay) {
+                        bestOnTime = b;
+                    }
+                }
+            });
+            
+            // Render leaderboards
+            if (fastest && fastest.speed > 0) {
+                kingTitle.innerText = `Route ${fastest.route}`;
+                kingSub.innerText = `Bus #${fastest.id} • Trip ${fastest.trip_id ? fastest.trip_id.substring(0,8) : 'N/A'}`;
+                kingStat.innerText = `${(fastest.speed * 2.23694).toFixed(1)} mph`;
+            } else {
+                kingTitle.innerText = "None";
+                kingSub.innerText = "No moving buses";
+                kingStat.innerText = "-- mph";
+            }
+            
+            if (slowestMoving) {
+                snailTitle.innerText = `Route ${slowestMoving.route}`;
+                snailSub.innerText = `Bus #${slowestMoving.id} • Heading ${getCompass(slowestMoving.bearing)}`;
+                snailStat.innerText = `${(slowestMoving.speed * 2.23694).toFixed(1)} mph`;
+            } else {
+                snailTitle.innerText = "None";
+                snailSub.innerText = "No slow crawlers";
+                snailStat.innerText = "-- mph";
+            }
+            
+            if (mostDelayed) {
+                let mins = (mostDelayed.delay / 60).toFixed(1);
+                victimTitle.innerText = `Route ${mostDelayed.route}`;
+                victimSub.innerText = `Bus #${mostDelayed.id} • Clamped in gridlock`;
+                victimStat.innerText = `+${mins}m`;
+            } else {
+                victimTitle.innerText = "Perfect Fleet";
+                victimSub.innerText = "Zero delayed routes";
+                victimStat.innerText = "0.0m";
+            }
+            
+            if (bestOnTime) {
+                let mins = (bestOnTime.delay / 60).toFixed(1);
+                championTitle.innerText = `Route ${bestOnTime.route}`;
+                championSub.innerText = `Bus #${bestOnTime.id} • Ahead/On schedule`;
+                championStat.innerText = `${mins}m`;
+            } else {
+                championTitle.innerText = "None";
+                championSub.innerText = "No schedule sync";
+                championStat.innerText = "-- min";
+            }
+        }
+
+        function getCompass(deg) {
+            const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+            const idx = Math.round(deg / 45) % 8;
+            return `${directions[idx]} (${deg.toFixed(0)}°)`;
+        }
+
+        function handleSort(col) {
+            if (sortCol === col) {
+                sortAsc = !sortAsc;
+            } else {
+                sortCol = col;
+                sortAsc = true;
+            }
+            
+            // Update UI headers
+            document.querySelectorAll('th').forEach(th => {
+                th.classList.remove('sort-active', 'sort-asc');
+            });
+            const activeTh = document.getElementById(`th-${col}`);
+            if (activeTh) {
+                activeTh.classList.add('sort-active');
+                if (sortAsc) activeTh.classList.add('sort-asc');
+            }
+            
+            applyFiltersAndRender();
+        }
+
+        function applyFiltersAndRender() {
+            filteredBuses = buses.filter(b => {
+                // Search query filter
+                const sMph = (b.speed * 2.23694).toFixed(1);
+                const delayMins = (b.delay / 60).toFixed(1);
+                const textStatus = getStatusText(b.speed, b.delay);
+                const operator = b.id.startsWith("rideon_") ? "RideOn" : "WMATA";
+                const searchStr = `${b.id} ${b.route} ${b.trip_id || ''} ${textStatus} ${operator}`.toLowerCase();
+                const matchesSearch = searchStr.includes(searchQuery.toLowerCase());
+                
+                // Route filter
+                const matchesRoute = routeFilter === "ALL" || b.route === routeFilter;
+                
+                // Status filter
+                let matchesStatus = true;
+                if (statusFilter === "MOVING") matchesStatus = b.speed * 2.23694 > 2.0;
+                else if (statusFilter === "HALTED") matchesStatus = b.speed * 2.23694 <= 2.0;
+                else if (statusFilter === "LATE") matchesStatus = b.delay && b.delay > 60;
+                
+                return matchesSearch && matchesRoute && matchesStatus;
+            });
+            
+            // Sort
+            filteredBuses.sort((a, b) => {
+                let valA, valB;
+                
+                if (sortCol === "id") {
+                    valA = parseInt(a.id.replace(/\D/g, "")) || 0;
+                    valB = parseInt(b.id.replace(/\D/g, "")) || 0;
+                } else if (sortCol === "route") {
+                    valA = a.route;
+                    valB = b.route;
+                } else if (sortCol === "speed") {
+                    valA = a.speed;
+                    valB = b.speed;
+                } else if (sortCol === "delay") {
+                    valA = a.delay || 0;
+                    valB = b.delay || 0;
+                } else if (sortCol === "status") {
+                    valA = getStatusText(a.speed, a.delay);
+                    valB = getStatusText(b.speed, b.delay);
+                } else if (sortCol === "bearing") {
+                    valA = a.bearing || 0;
+                    valB = b.bearing || 0;
+                }
+                
+                if (valA < valB) return sortAsc ? -1 : 1;
+                if (valA > valB) return sortAsc ? 1 : -1;
+                return 0;
+            });
+            
+            renderTable();
+        }
+
+        function getStatusText(speed, delay) {
+            let speedMph = speed * 2.23694;
+            if (delay && delay > 60) return "LATE";
+            if (speedMph <= 2.0) return "HALTED";
+            return "MOVING";
+        }
+
+        function renderTable() {
+            if (filteredBuses.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="8" class="empty-state">No buses match the current filter selection criteria.</td></tr>`;
+                return;
+            }
+            
+            let html = "";
+            filteredBuses.forEach(b => {
+                let speedMph = b.speed * 2.23694;
+                let delayMins = b.delay ? (b.delay / 60).toFixed(1) : "0.0";
+                
+                // Status mapping
+                let statusClass = "status-moving";
+                let statusText = "Moving";
+                if (b.delay && b.delay > 60) {
+                    statusClass = "status-late";
+                    statusText = `Late (+${delayMins}m)`;
+                } else if (speedMph <= 2.0) {
+                    statusClass = "status-halted";
+                    statusText = "Halted";
+                }
+                
+                // Delay column styling
+                let delayCol = '<span class="delay-ontime">On Schedule (0.0m)</span>';
+                if (b.delay && b.delay > 60) {
+                    delayCol = `<span class="delay-late">🔴 Delayed (+${delayMins}m)</span>`;
+                } else if (b.delay && b.delay < -60) {
+                    let earlyMins = Math.abs(b.delay / 60).toFixed(1);
+                    delayCol = `<span class="delay-early">🔵 Early (${earlyMins}m)</span>`;
+                }
+                
+                let operator = b.id.startsWith("rideon_") ? "RideOn" : "WMATA";
+                let displayId = b.id.replace("wmata_", "").replace("rideon_", "");
+                let displayRoute = b.route.replace("wmata_", "").replace("rideon_", "");
+                let operatorColor = operator === "RideOn" ? "#ffd60a" : "#00f2ff";
+                let operatorBadge = `<span style="font-size:0.75rem; padding: 2px 6px; border-radius: 4px; background: ${operatorColor}22; color: ${operatorColor}; margin-right: 8px; border: 1px solid ${operatorColor}55;">${operator}</span>`;
+                
+                html += `
+                    <tr>
+                        <td>
+                            <div class="bus-badge">
+                                <span>🚌</span>
+                                ${operatorBadge}
+                                <b>Bus ${displayId}</b>
+                            </div>
+                        </td>
+                        <td><span class="route-pill">Route ${displayRoute}</span></td>
+                        <td><b>${speedMph.toFixed(1)}</b> <span style="font-size:0.8rem; color:var(--text-muted);">mph</span></td>
+                        <td>${delayCol}</td>
+                        <td>
+                            <div class="status-badge ${statusClass}">
+                                <span class="dot-indicator"></span>
+                                ${statusText}
+                            </div>
+                        </td>
+                        <td><span style="font-family:monospace;">${getCompass(b.bearing)}</span></td>
+                        <td><span style="font-family:monospace; font-size:0.8rem; color:var(--text-muted);">${b.trip_id ? b.trip_id.substring(0,10) : 'N/A'}</span></td>
+                        <td style="text-align: right;">
+                            <a href="index.html?lat=${b.lat}&lon=${b.lon}&zoom=15&route=${b.route}" class="track-link">
+                                📍 Track on Map
+                            </a>
+                        </td>
+                    </tr>
+                `;
+            });
+            
+            tbody.innerHTML = html;
+        }
+
+        // Event listeners
+        searchInput.addEventListener('input', (e) => {
+            searchQuery = e.target.value;
+            applyFiltersAndRender();
+        });
+
+        rSelect.addEventListener('change', (e) => {
+            routeFilter = e.target.value;
+            applyFiltersAndRender();
+        });
+
+        sSelect.addEventListener('change', (e) => {
+            statusFilter = e.target.value;
+            applyFiltersAndRender();
+        });
+
+        resetBtn.addEventListener('click', () => {
+            searchInput.value = "";
+            rSelect.value = "ALL";
+            sSelect.value = "ALL";
+            
+            searchQuery = "";
+            routeFilter = "ALL";
+            statusFilter = "ALL";
+            
+            applyFiltersAndRender();
+        });
+
+        // Initialize
+        fetchLiveBuses();
+        setInterval(fetchLiveBuses, 5000); // Poll every 5s for snappy table updates!
+    </script>
+</body>
+</html>
