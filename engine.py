@@ -17,6 +17,51 @@ import json
 import csv
 import math
 
+POTOMAC_BARRIER = [
+    ((38.995, -77.162), (38.960, -77.130)),
+    ((38.960, -77.130), (38.930, -77.115)),
+    ((38.930, -77.115), (38.900, -77.070)),
+    ((38.900, -77.070), (38.888, -77.060)),
+    ((38.888, -77.060), (38.875, -77.043)),
+    ((38.875, -77.043), (38.850, -77.040)),
+    ((38.850, -77.040), (38.790, -77.035))
+]
+
+ANACOSTIA_BARRIER = [
+    ((38.935, -76.940), (38.915, -76.955)),
+    ((38.915, -76.955), (38.900, -76.965)),
+    ((38.900, -76.965), (38.875, -76.980)),
+    ((38.875, -76.980), (38.860, -77.010)),
+    ((38.860, -77.010), (38.858, -77.025))
+]
+
+def ccw(A, B, C):
+    return (C[0] - A[0]) * (B[1] - A[1]) > (B[0] - A[0]) * (C[1] - A[1])
+
+def segments_intersect(A, B, C, D):
+    return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+
+def crosses_river(lat1, lon1, lat2, lon2):
+    p1 = (lat1, lon1)
+    p2 = (lat2, lon2)
+    for seg in POTOMAC_BARRIER:
+        if segments_intersect(p1, p2, seg[0], seg[1]):
+            return True
+    for seg in ANACOSTIA_BARRIER:
+        if segments_intersect(p1, p2, seg[0], seg[1]):
+            return True
+    return False
+
+def smooth_floor(x, k=100.0):
+    if isinstance(x, np.ndarray):
+        kx = k * x
+        return np.where(kx > 50.0, x, np.log1p(np.exp(np.clip(kx, -50.0, 50.0))) / k)
+    else:
+        kx = k * x
+        if kx > 50.0:
+            return x
+        return math.log1p(math.exp(kx)) / k
+
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("WMATA_API_KEY", "YOUR_API_KEY_HERE")
 GTFS_DIR = "gtfs"
@@ -153,6 +198,7 @@ state = {
     "bikeshare": {"total_bikes": 0, "active_stations": 0, "depleted_stations": 0, "depleted_node_indices": [], "node_to_metadata": {}},
     "gtfs_delays": {},
     "trip_delays": {},
+    "trip_to_shape": {},
     "live_speeds": {}, # stop_id -> current speed in mph
     "live_speeds_list": {}, # stop_id -> list of raw speeds reported
     "live_buses": {}, # route_id -> list of vehicle_ids
@@ -322,6 +368,11 @@ def load_static_topology():
     st_df['route_id'] = st_df['trip_id'].map(trip_to_route)
     route_to_stops = st_df.groupby('route_id')['stop_id'].unique().apply(lambda x: [str(i) for i in x]).to_dict()
     
+    if 'shape_id' in trips_df.columns:
+        state['trip_to_shape'] = trips_df.dropna(subset=['shape_id']).set_index('trip_id')['shape_id'].astype(str).to_dict()
+    else:
+        state['trip_to_shape'] = {}
+    
     trip_ids = st_df['trip_id'].values
     stop_ids = st_df['stop_id'].astype(str).values
     rows, cols = [], []
@@ -365,10 +416,11 @@ def load_static_topology():
                 dist_m = math.sqrt(dlat**2 + (math.cos(lat_mid) * dlon)**2) * 6371000.0
                 
                 if dist_m <= 300.0:
-                    rows.append(w_idx)
-                    cols.append(r_idx)
-                    rows.append(r_idx)
-                    cols.append(w_idx)
+                    if not crosses_river(w_lat, w_lon, r_lat, r_lon):
+                        rows.append(w_idx)
+                        cols.append(r_idx)
+                        rows.append(r_idx)
+                        cols.append(w_idx)
                     
     W_full = sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n_all, n_all))
     _, labels = connected_components(csgraph=W_full, directed=False)
@@ -397,33 +449,72 @@ def load_static_topology():
     stops_list.sort(key=lambda x: x['name'])
     with open(os.path.join(static_dir, "stops_list.json"), "w") as f_stops:
         json.dump(stops_list, f_stops)
+
+    # Generate static/shapes.json if it does not exist
+    shapes_json_path = os.path.join(static_dir, "shapes.json")
+    if not os.path.exists(shapes_json_path):
+        shapes_map = {}
+        # Load WMATA shapes
+        wmata_shapes_path = os.path.join(GTFS_DIR, "shapes.txt")
+        if os.path.exists(wmata_shapes_path):
+            try:
+                df_sh = pd.read_csv(wmata_shapes_path, low_memory=False)
+                df_sh = df_sh.sort_values(by=['shape_id', 'shape_pt_sequence'])
+                for sh_id, group in df_sh.groupby('shape_id'):
+                    coords = group[['shape_pt_lat', 'shape_pt_lon']].values.tolist()
+                    downsampled = coords[::4]
+                    if len(coords) > 0 and (len(coords) - 1) % 4 != 0:
+                        downsampled.append(coords[-1])
+                    shapes_map['wmata_' + str(sh_id)] = downsampled
+            except Exception as e:
+                print(f"Error parsing WMATA shapes.txt: {e}")
+                
+        # Load RideOn shapes
+        rideon_shapes_path = os.path.join(GTFS_DIR, "rideon", "shapes.txt")
+        if os.path.exists(rideon_shapes_path):
+            try:
+                df_sh = pd.read_csv(rideon_shapes_path, low_memory=False)
+                df_sh = df_sh.sort_values(by=['shape_id', 'shape_pt_sequence'])
+                for sh_id, group in df_sh.groupby('shape_id'):
+                    coords = group[['shape_pt_lat', 'shape_pt_lon']].values.tolist()
+                    downsampled = coords[::4]
+                    if len(coords) > 0 and (len(coords) - 1) % 4 != 0:
+                        downsampled.append(coords[-1])
+                    shapes_map['rideon_' + str(sh_id)] = downsampled
+            except Exception as e:
+                print(f"Error parsing RideOn shapes.txt: {e}")
+                
+        with open(shapes_json_path, "w") as f_sh_json:
+            json.dump(shapes_map, f_sh_json)
         
     return W, nodes_list, node_to_idx, stops_info, tree, route_to_stops
 
-async def poll_weather():
-    async with aiohttp.ClientSession() as session:
-        while True:
-            try:
-                async with session.get(WEATHER_URL) as resp:
-                    data = await resp.json()
-                    w_code = data.get('current_weather', {}).get('weathercode', 0)
-                    if w_code > 50: state['weather_penalty'] = 0.85; state['weather_desc'] = "Precipitation 🌨️"
-                    else: state['weather_penalty'] = 1.0; state['weather_desc'] = "Clear ☀️"
-                    
-                    # Extract hourly precipitation rate matching the current time
-                    precip = 0.0
-                    hourly_data = data.get('hourly', {})
-                    if 'precipitation' in hourly_data:
-                        import datetime
-                        now_hour_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:00")
-                        if now_hour_str in hourly_data.get('time', []):
-                            idx = hourly_data['time'].index(now_hour_str)
-                            precip = float(hourly_data['precipitation'][idx])
-                        else:
-                            precip = float(hourly_data['precipitation'][0]) if hourly_data['precipitation'] else 0.0
-                    state['precipitation_rate'] = precip
-            except: pass
-            await asyncio.sleep(POLL_INTERVAL_WEATHER)
+async def poll_weather_once(session):
+    try:
+        async with session.get(WEATHER_URL) as resp:
+            data = await resp.json()
+            w_code = data.get('current_weather', {}).get('weathercode', 0)
+            if w_code > 50:
+                state['weather_penalty'] = 0.85
+                state['weather_desc'] = "Precipitation 🌨️"
+            else:
+                state['weather_penalty'] = 1.0
+                state['weather_desc'] = "Clear ☀️"
+            
+            # Extract hourly precipitation rate matching the current time
+            precip = 0.0
+            hourly_data = data.get('hourly', {})
+            if 'precipitation' in hourly_data:
+                import datetime
+                now_hour_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:00")
+                if now_hour_str in hourly_data.get('time', []):
+                    idx = hourly_data['time'].index(now_hour_str)
+                    precip = float(hourly_data['precipitation'][idx])
+                else:
+                    precip = float(hourly_data['precipitation'][0]) if hourly_data['precipitation'] else 0.0
+            state['precipitation_rate'] = precip
+    except Exception as e:
+        print(f"Error in poll_weather_once: {e}")
 
 async def fetch_incident_layer(session, url, tree, region_key):
     if not url:
@@ -445,391 +536,348 @@ async def fetch_incident_layer(session, url, tree, region_key):
                 state['incidents'][region_key] = snapped
     except: pass
 
-async def poll_incidents(tree):
-    async with aiohttp.ClientSession() as session:
-        while True:
-            await asyncio.gather(fetch_incident_layer(session, INCIDENTS_DC, tree, "dc"),
-                                 fetch_incident_layer(session, INCIDENTS_MD, tree, "md"),
-                                 fetch_incident_layer(session, INCIDENTS_VA, tree, "va"))
-            await asyncio.sleep(POLL_INTERVAL_INCIDENTS)
+async def poll_incidents_once(session, tree):
+    await asyncio.gather(
+        fetch_incident_layer(session, INCIDENTS_DC, tree, "dc"),
+        fetch_incident_layer(session, INCIDENTS_MD, tree, "md"),
+        fetch_incident_layer(session, INCIDENTS_VA, tree, "va")
+    )
 
-async def poll_bikeshare(tree):
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(BIKESHARE_INFO) as resp:
-                info_data = await resp.json(); stations = info_data['data']['stations']
-                id_to_node = {s['station_id']: int(tree.query([s['lat'], s['lon']])[1]) for s in stations if tree.query([s['lat'], s['lon']])[0] < 0.0015}
-                station_metadata = {s['station_id']: {"name": s['name'], "capacity": s['capacity']} for s in stations}
-        except: return
-        while True:
-            try:
-                async with session.get(BIKESHARE_STATUS) as resp:
-                    data = await resp.json(); stats = data['data']['stations']
-                    total = 0; depl_idx = []
-                    node_to_metadata = {}
-                    for s in stats:
-                        bikes = s['num_bikes_available'] + s['num_ebikes_available']; total += bikes
-                        if bikes < 2 and s['station_id'] in id_to_node:
-                            n_idx = id_to_node[s['station_id']]
-                            depl_idx.append(n_idx)
-                            meta = station_metadata.get(s['station_id'], {"name": "Capital Bikeshare", "capacity": 0})
-                            node_to_metadata[n_idx] = {
-                                "name": meta["name"],
-                                "bikes": bikes,
-                                "docks": s['num_docks_available'],
-                                "capacity": meta["capacity"]
-                            }
-                    state['bikeshare'].update({
-                        "total_bikes": total, 
-                        "active_stations": len(stats), 
-                        "depleted_stations": len(depl_idx), 
-                        "depleted_node_indices": depl_idx,
-                        "node_to_metadata": node_to_metadata
-                    })
-            except: pass
-            await asyncio.sleep(POLL_INTERVAL_BIKESHARE)
+async def poll_bikeshare_once(session, tree):
+    try:
+        async with session.get(BIKESHARE_INFO) as resp:
+            info_data = await resp.json()
+            stations = info_data['data']['stations']
+            id_to_node = {s['station_id']: int(tree.query([s['lat'], s['lon']])[1]) for s in stations if tree.query([s['lat'], s['lon']])[0] < 0.0015}
+            station_metadata = {s['station_id']: {"name": s['name'], "capacity": s['capacity']} for s in stations}
+    except Exception as e:
+        print(f"Error in poll_bikeshare_once (info): {e}")
+        return
 
-async def poll_gtfs_rt():
-    headers = {"api_key": API_KEY}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        while True:
-            try:
-                async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-tripupdates.pb") as resp:
-                    content = await resp.read(); feed = gtfs_realtime_pb2.FeedMessage(); feed.ParseFromString(content)
-                    delays = {}
-                    trip_delays = {}
-                    for entity in feed.entity:
-                        if entity.HasField('trip_update'):
-                            tu = entity.trip_update
-                            t_id = 'wmata_' + str(tu.trip.trip_id)
-                            for stu in tu.stop_time_update:
-                                s_id = 'wmata_' + str(stu.stop_id)
-                                d_val = stu.departure.delay if stu.HasField('departure') and stu.departure.HasField('delay') else (stu.arrival.delay if stu.HasField('arrival') and stu.arrival.HasField('delay') else 0)
-                                delays[s_id] = d_val
-                                if t_id not in trip_delays and d_val != 0:
-                                    trip_delays[t_id] = d_val
-                    
-                    # Merge delays safely
-                    for k in list(state['gtfs_delays'].keys()):
-                        if k.startswith('wmata_'): del state['gtfs_delays'][k]
-                    for k in list(state['trip_delays'].keys()):
-                        if k.startswith('wmata_'): del state['trip_delays'][k]
-                    state['gtfs_delays'].update(delays)
-                    state['trip_delays'].update(trip_delays)
-                    state['last_payload_ts'] = time.time()
-            except: pass
-            await asyncio.sleep(POLL_INTERVAL_GTFS)
+    try:
+        async with session.get(BIKESHARE_STATUS) as resp:
+            data = await resp.json()
+            stats = data['data']['stations']
+            total = 0
+            depl_idx = []
+            node_to_metadata = {}
+            for s in stats:
+                bikes = s['num_bikes_available'] + s['num_ebikes_available']
+                total += bikes
+                if bikes < 2 and s['station_id'] in id_to_node:
+                    n_idx = id_to_node[s['station_id']]
+                    depl_idx.append(n_idx)
+                    meta = station_metadata.get(s['station_id'], {"name": "Capital Bikeshare", "capacity": 0})
+                    node_to_metadata[n_idx] = {
+                        "name": meta["name"],
+                        "bikes": bikes,
+                        "docks": s['num_docks_available'],
+                        "capacity": meta["capacity"]
+                    }
+            state['bikeshare'].update({
+                "total_bikes": total, 
+                "active_stations": len(stats), 
+                "depleted_stations": len(depl_idx), 
+                "depleted_node_indices": depl_idx,
+                "node_to_metadata": node_to_metadata
+            })
+    except Exception as e:
+        print(f"Error in poll_bikeshare_once (status): {e}")
 
-async def poll_rideon_gtfs_rt(tree, nodes_list):
+async def poll_gtfs_rt_once(session):
+    try:
+        async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-tripupdates.pb") as resp:
+            if resp.status == 200:
+                content = await resp.read()
+                feed = gtfs_realtime_pb2.FeedMessage()
+                feed.ParseFromString(content)
+                delays = {}
+                trip_delays = {}
+                for entity in feed.entity:
+                    if entity.HasField('trip_update'):
+                        tu = entity.trip_update
+                        t_id = 'wmata_' + str(tu.trip.trip_id)
+                        for stu in tu.stop_time_update:
+                            s_id = 'wmata_' + str(stu.stop_id)
+                            d_val = stu.departure.delay if stu.HasField('departure') and stu.departure.HasField('delay') else (stu.arrival.delay if stu.HasField('arrival') and stu.arrival.HasField('delay') else 0)
+                            delays[s_id] = d_val
+                            if t_id not in trip_delays and d_val != 0:
+                                trip_delays[t_id] = d_val
+                
+                # Merge delays safely
+                for k in list(state['gtfs_delays'].keys()):
+                    if k.startswith('wmata_'): del state['gtfs_delays'][k]
+                for k in list(state['trip_delays'].keys()):
+                    if k.startswith('wmata_'): del state['trip_delays'][k]
+                state['gtfs_delays'].update(delays)
+                state['trip_delays'].update(trip_delays)
+                state['last_payload_ts'] = time.time()
+    except Exception as e:
+        print(f"Error in poll_gtfs_rt_once: {e}")
+
+async def poll_rideon_vp_once(session, tree, nodes_list):
     api_key = os.environ.get("RIDEON_API_KEY", "")
     client_id = os.environ.get("RIDEON_CLIENT_ID", "")
     if not api_key or not client_id:
-        print("⚠️ Montgomery County RideOn API credentials missing, skipping RideOn live telemetry...")
         return
-
     url_vp = f"http://rideon.app/json/GetGtfsRealtimeVehiclePositions?apiKey={api_key}&ClientId={client_id}"
+    try:
+        async with session.get(url_vp) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                if "Access denied" not in text:
+                    data = json.loads(text)
+                    current_speeds_list = {}
+                    current_buses = {}
+                    rideon_bus_dict = {}
+                    
+                    for v in data:
+                        trip_obj = v.get("Trip", {})
+                        veh_obj = v.get("Vehicle", {})
+                        pos_obj = v.get("Position", {})
+                        
+                        v_id = 'rideon_' + str(veh_obj.get("Id", ""))
+                        r_id = 'rideon_' + str(trip_obj.get("RouteId", ""))
+                        stop_id = 'rideon_' + str(v.get("StopId")) if v.get("StopId") else None
+                        
+                        lat = float(pos_obj.get("Latitude", 0.0)) if pos_obj.get("Latitude") else 0.0
+                        lon = float(pos_obj.get("Longitude", 0.0)) if pos_obj.get("Longitude") else 0.0
+                        bearing = float(pos_obj.get("Bearing", 0.0)) if pos_obj.get("Bearing") else 0.0
+                        speed_mph = float(pos_obj.get("Speed", 0.0)) if pos_obj.get("Speed") else 0.0
+                        speed_mps = speed_mph / 2.23694
+                        
+                        # Snap fallback
+                        if not stop_id and lat != 0.0 and lon != 0.0:
+                            dist, idx = tree.query([lat, lon])
+                            if dist < 0.001:
+                                snapped_id = nodes_list[idx]
+                                if snapped_id.startswith('rideon_'):
+                                    stop_id = snapped_id
+                                    
+                        if r_id not in current_buses:
+                            current_buses[r_id] = []
+                        current_buses[r_id].append(v_id)
+                        
+                        timestamp = int(v.get("Timestamp")) if v.get("Timestamp") else int(time.time())
+                        t_id = 'rideon_' + str(trip_obj.get("TripId")) if trip_obj.get("TripId") else None
+                        
+                        delay_sec = 0
+                        if t_id and t_id in state.get('trip_delays', {}):
+                            delay_sec = int(state['trip_delays'][t_id])
+                        elif stop_id and stop_id in state.get('gtfs_delays', {}):
+                            delay_sec = int(state['gtfs_delays'][stop_id])
+                            
+                        if lat != 0.0 and lon != 0.0:
+                            rideon_bus_dict[v_id] = {
+                                "id": v_id,
+                                "route": r_id,
+                                "lat": lat,
+                                "lon": lon,
+                                "bearing": bearing,
+                                "speed": speed_mps,
+                                "timestamp": timestamp,
+                                "trip_id": t_id,
+                                "delay": delay_sec,
+                                "shape_id": state.get('trip_to_shape', {}).get(t_id) if t_id else None
+                            }
+                            
+                        if stop_id:
+                            if stop_id not in current_speeds_list:
+                                current_speeds_list[stop_id] = []
+                            current_speeds_list[stop_id].append(speed_mph)
+                            
+                        # Canary tracking
+                        if v_id in state['canary_buses']:
+                            canary = state['canary_buses'][v_id]
+                            if speed_mph < 2.0:
+                                canary['status'] = "IMPACT CONFIRMED"
+                                if r_id in state['active_predictions'] and state['active_predictions'][r_id]['t_physical'] is None:
+                                    state['active_predictions'][r_id]['t_physical'] = time.time()
+                            else:
+                                canary['status'] = f"Tracking ({speed_mph:.1f}mph)"
+                                
+                    # Merge bus positions dictionary
+                    for k in list(state['bus_positions_dict'].keys()):
+                        if k.startswith('rideon_'): del state['bus_positions_dict'][k]
+                    state['bus_positions_dict'].update(rideon_bus_dict)
+                    
+                    # Merge live speeds list
+                    for k in list(state['live_speeds_list'].keys()):
+                        if k.startswith('rideon_'): del state['live_speeds_list'][k]
+                    state['live_speeds_list'].update(current_speeds_list)
+                    
+                    for k in list(state['live_speeds'].keys()):
+                        if k.startswith('rideon_'): del state['live_speeds'][k]
+                    for stop_id, speeds in current_speeds_list.items():
+                        if speeds:
+                            state['live_speeds'][stop_id] = sum(speeds) / len(speeds)
+                            
+                    # Merge live buses
+                    for k in list(state['live_buses'].keys()):
+                        if k.startswith('rideon_'): del state['live_buses'][k]
+                    state['live_buses'].update(current_buses)
+                    
+                    state['last_payload_ts'] = time.time()
+    except Exception as e:
+        print(f"Error in poll_rideon_vp_once: {e}")
+
+async def poll_rideon_tu_once(session):
+    api_key = os.environ.get("RIDEON_API_KEY", "")
+    client_id = os.environ.get("RIDEON_CLIENT_ID", "")
+    if not api_key or not client_id:
+        return
     url_tu = f"http://rideon.app/json/GetGtfsRealtimeTripUpdates?apiKey={api_key}&ClientId={client_id}"
-    
-    last_poll_time_vp = None
-    last_poll_time_tu = None
-    
-    rideon_trip_delays = {}
-    rideon_delays = {}
-    
-    while True:
-        now = time.time()
-        
-        # 1. Poll Vehicle Positions
-        if rate_limiter.can_request(url_vp, now):
-            if last_poll_time_vp is not None:
-                elapsed = now - last_poll_time_vp
-                print(f"[Telemetry] RideOn VP poll interval: {elapsed:.2f}s (strictly >= 20s: {elapsed >= 20.0})")
-            last_poll_time_vp = now
-            rate_limiter.record_request(url_vp, now)
-            
-            try:
-                timeout = aiohttp.ClientTimeout(total=15.0)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url_vp) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                            if "Access denied" in text:
-                                print(f"⚠️ RideOn VP API rate limit message returned: {text[:150]}")
-                            else:
-                                data = json.loads(text)
-                                current_speeds_list = {}
-                                current_buses = {}
-                                rideon_bus_dict = {}
+    try:
+        async with session.get(url_tu) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                if "Access denied" not in text:
+                    data = json.loads(text)
+                    new_delays = {}
+                    new_trip_delays = {}
+                    for item in data:
+                        trip_obj = item.get("Trip", {})
+                        t_id = 'rideon_' + str(trip_obj.get("TripId", ""))
+                        for stu in item.get("StopTimeUpdates", []):
+                            s_id = 'rideon_' + str(stu.get("StopId", ""))
+                            d_val = 0
+                            new_delays[s_id] = d_val
+                            if t_id not in new_trip_delays and d_val != 0:
+                                new_trip_delays[t_id] = d_val
                                 
-                                for v in data:
-                                    trip_obj = v.get("Trip", {})
-                                    veh_obj = v.get("Vehicle", {})
-                                    pos_obj = v.get("Position", {})
-                                    
-                                    v_id = 'rideon_' + str(veh_obj.get("Id", ""))
-                                    r_id = 'rideon_' + str(trip_obj.get("RouteId", ""))
-                                    stop_id = 'rideon_' + str(v.get("StopId")) if v.get("StopId") else None
-                                    
-                                    lat = float(pos_obj.get("Latitude", 0.0)) if pos_obj.get("Latitude") else 0.0
-                                    lon = float(pos_obj.get("Longitude", 0.0)) if pos_obj.get("Longitude") else 0.0
-                                    bearing = float(pos_obj.get("Bearing", 0.0)) if pos_obj.get("Bearing") else 0.0
-                                    speed_mph = float(pos_obj.get("Speed", 0.0)) if pos_obj.get("Speed") else 0.0
-                                    speed_mps = speed_mph / 2.23694
-                                    
-                                    # Snap fallback
-                                    if not stop_id and lat != 0.0 and lon != 0.0:
-                                        dist, idx = tree.query([lat, lon])
-                                        if dist < 0.001:
-                                            snapped_id = nodes_list[idx]
-                                            if snapped_id.startswith('rideon_'):
-                                                stop_id = snapped_id
-                                                
-                                    if r_id not in current_buses:
-                                        current_buses[r_id] = []
-                                    current_buses[r_id].append(v_id)
-                                    
-                                    timestamp = int(v.get("Timestamp")) if v.get("Timestamp") else int(time.time())
-                                    t_id = 'rideon_' + str(trip_obj.get("TripId")) if trip_obj.get("TripId") else None
-                                    
-                                    delay_sec = 0
-                                    if t_id and t_id in rideon_trip_delays:
-                                        delay_sec = int(rideon_trip_delays[t_id])
-                                    elif stop_id and stop_id in rideon_delays:
-                                        delay_sec = int(rideon_delays[stop_id])
-                                        
-                                    if lat != 0.0 and lon != 0.0:
-                                        rideon_bus_dict[v_id] = {
-                                            "id": v_id,
-                                            "route": r_id,
-                                            "lat": lat,
-                                            "lon": lon,
-                                            "bearing": bearing,
-                                            "speed": speed_mps,
-                                            "timestamp": timestamp,
-                                            "trip_id": t_id,
-                                            "delay": delay_sec
-                                        }
-                                        
-                                    if stop_id:
-                                        if stop_id not in current_speeds_list:
-                                            current_speeds_list[stop_id] = []
-                                        current_speeds_list[stop_id].append(speed_mph)
-                                        
-                                    # Canary tracking
-                                    if v_id in state['canary_buses']:
-                                        canary = state['canary_buses'][v_id]
-                                        if speed_mph < 2.0:
-                                            canary['status'] = "IMPACT CONFIRMED"
-                                            if r_id in state['active_predictions'] and state['active_predictions'][r_id]['t_physical'] is None:
-                                                state['active_predictions'][r_id]['t_physical'] = time.time()
-                                        else:
-                                            canary['status'] = f"Tracking ({speed_mph:.1f}mph)"
-                                            
-                                # Merge bus positions dictionary
-                                for k in list(state['bus_positions_dict'].keys()):
-                                    if k.startswith('rideon_'): del state['bus_positions_dict'][k]
-                                state['bus_positions_dict'].update(rideon_bus_dict)
-                                
-                                # Merge live speeds list
-                                for k in list(state['live_speeds_list'].keys()):
-                                    if k.startswith('rideon_'): del state['live_speeds_list'][k]
-                                state['live_speeds_list'].update(current_speeds_list)
-                                
-                                for k in list(state['live_speeds'].keys()):
-                                    if k.startswith('rideon_'): del state['live_speeds'][k]
-                                for stop_id, speeds in current_speeds_list.items():
-                                    if speeds:
-                                        state['live_speeds'][stop_id] = sum(speeds) / len(speeds)
-                                        
-                                # Merge live buses
-                                for k in list(state['live_buses'].keys()):
-                                    if k.startswith('rideon_'): del state['live_buses'][k]
-                                state['live_buses'].update(current_buses)
-                                
-                                state['last_payload_ts'] = time.time()
-                        else:
-                            print(f"⚠️ Warning: RideOn VP poll returned HTTP status {resp.status}")
-            except Exception as e:
-                print(f"⚠️ Error polling RideOn VP: {e}")
+                    # Merge delays
+                    for k in list(state['gtfs_delays'].keys()):
+                        if k.startswith('rideon_'): del state['gtfs_delays'][k]
+                    for k in list(state['trip_delays'].keys()):
+                        if k.startswith('rideon_'): del state['trip_delays'][k]
+                    state['gtfs_delays'].update(new_delays)
+                    state['trip_delays'].update(new_trip_delays)
+    except Exception as e:
+        print(f"Error in poll_rideon_tu_once: {e}")
+
+async def poll_alerts_once(session):
+    try:
+        async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-alerts.pb") as resp:
+            if resp.status == 200:
+                content = await resp.read()
+                feed = gtfs_realtime_pb2.FeedMessage()
+                feed.ParseFromString(content)
+                active_alerts = 0
+                alerted_routes = set()
+                for entity in feed.entity:
+                    if entity.HasField('alert'):
+                        active_alerts += 1
+                        for informed in entity.alert.informed_entity:
+                            if informed.HasField('route_id'):
+                                alerted_routes.add('wmata_' + str(informed.route_id))
+                state['wmata_official_alerts'] = alerted_routes
+                state['graph_stats']['active_alerts'] = active_alerts
+    except Exception as e:
+        print(f"Error in poll_alerts_once: {e}")
+
+async def poll_vehicle_positions_once(session):
+    try:
+        async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-vehiclepositions.pb") as resp:
+            if resp.status == 200:
+                content = await resp.read()
+                feed = gtfs_realtime_pb2.FeedMessage()
+                feed.ParseFromString(content)
                 
-            await asyncio.sleep(15.0)
-            now = time.time()
-            
-        # 2. Poll Trip Updates
-        if rate_limiter.can_request(url_tu, now):
-            if last_poll_time_tu is not None:
-                elapsed = now - last_poll_time_tu
-                print(f"[Telemetry] RideOn TU poll interval: {elapsed:.2f}s (strictly >= 20s: {elapsed >= 20.0})")
-            last_poll_time_tu = now
-            rate_limiter.record_request(url_tu, now)
-            
-            try:
-                timeout = aiohttp.ClientTimeout(total=15.0)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url_tu) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                            if "Access denied" in text:
-                                print(f"⚠️ RideOn TU API rate limit message returned: {text[:150]}")
+                current_speeds_list = {}
+                current_buses = {}
+                wmata_bus_dict = {}
+                for entity in feed.entity:
+                    if entity.HasField('vehicle'):
+                        v = entity.vehicle
+                        v_id = 'wmata_' + str(v.vehicle.id)
+                        r_id = 'wmata_' + str(v.trip.route_id)
+                        stop_id = 'wmata_' + str(v.stop_id) if v.stop_id else None
+                        
+                        if r_id not in current_buses: current_buses[r_id] = []
+                        current_buses[r_id].append(v_id)
+
+                        speed_mph = (v.position.speed * 2.23694) if v.position.speed else 0
+                        
+                        lat = float(v.position.latitude) if v.position.latitude else 0.0
+                        lon = float(v.position.longitude) if v.position.longitude else 0.0
+                        bearing = float(v.position.bearing) if v.position.bearing else 0.0
+                        speed_mps = float(v.position.speed) if v.position.speed else 0.0
+                        timestamp = int(v.timestamp) if v.timestamp else int(time.time())
+                        
+                        t_id = 'wmata_' + str(v.trip.trip_id) if v.trip.trip_id else None
+                        delay_sec = 0
+                        if t_id and 'trip_delays' in state and t_id in state['trip_delays']:
+                            delay_sec = int(state['trip_delays'][t_id])
+                        elif stop_id and 'gtfs_delays' in state and stop_id in state['gtfs_delays']:
+                            delay_sec = int(state['gtfs_delays'][stop_id])
+
+                        if lat != 0.0 and lon != 0.0:
+                            wmata_bus_dict[v_id] = {
+                                "id": v_id,
+                                "route": r_id,
+                                "lat": lat,
+                                "lon": lon,
+                                "bearing": bearing,
+                                "speed": speed_mps,
+                                "timestamp": timestamp,
+                                "trip_id": t_id,
+                                "delay": delay_sec,
+                                "shape_id": state.get('trip_to_shape', {}).get(t_id) if t_id else None
+                            }
+
+                        if stop_id:
+                            if stop_id not in current_speeds_list:
+                                current_speeds_list[stop_id] = []
+                            current_speeds_list[stop_id].append(speed_mph)
+                        
+                        # Canary Stats
+                        if v_id in state['canary_buses']:
+                            canary = state['canary_buses'][v_id]
+                            if speed_mph < 2.0:
+                                canary['status'] = "IMPACT CONFIRMED"
+                                if r_id in state['active_predictions'] and state['active_predictions'][r_id]['t_physical'] is None:
+                                    state['active_predictions'][r_id]['t_physical'] = time.time()
                             else:
-                                data = json.loads(text)
-                                new_delays = {}
-                                new_trip_delays = {}
-                                for item in data:
-                                    trip_obj = item.get("Trip", {})
-                                    t_id = 'rideon_' + str(trip_obj.get("TripId", ""))
-                                    for stu in item.get("StopTimeUpdates", []):
-                                        s_id = 'rideon_' + str(stu.get("StopId", ""))
-                                        d_val = 0
-                                        new_delays[s_id] = d_val
-                                        if t_id not in new_trip_delays and d_val != 0:
-                                            new_trip_delays[t_id] = d_val
-                                            
-                                rideon_delays = new_delays
-                                rideon_trip_delays = new_trip_delays
-                                
-                                # Merge delays
-                                for k in list(state['gtfs_delays'].keys()):
-                                    if k.startswith('rideon_'): del state['gtfs_delays'][k]
-                                for k in list(state['trip_delays'].keys()):
-                                    if k.startswith('rideon_'): del state['trip_delays'][k]
-                                state['gtfs_delays'].update(rideon_delays)
-                                state['trip_delays'].update(rideon_trip_delays)
-                        else:
-                            print(f"⚠️ Warning: RideOn TU poll returned HTTP status {resp.status}")
-            except Exception as e:
-                print(f"⚠️ Error polling RideOn TU: {e}")
+                                canary['status'] = f"Tracking ({speed_mph:.1f}mph)"
                 
-            await asyncio.sleep(15.0)
-        else:
-            await asyncio.sleep(2.0)
-
-async def poll_alerts(route_to_stops):
-    headers = {"api_key": API_KEY}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        while True:
-            try:
-                async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-alerts.pb") as resp:
-                    content = await resp.read(); feed = gtfs_realtime_pb2.FeedMessage(); feed.ParseFromString(content)
-                    active_alerts = 0
-                    alerted_routes = set()
-                    for entity in feed.entity:
-                        if entity.HasField('alert'):
-                            active_alerts += 1
-                            for informed in entity.alert.informed_entity:
-                                if informed.HasField('route_id'):
-                                    alerted_routes.add('wmata_' + str(informed.route_id))
-                    state['wmata_official_alerts'] = alerted_routes
-                    state['graph_stats']['active_alerts'] = active_alerts
-            except: pass
-            await asyncio.sleep(300)
-
-async def poll_vehicle_positions():
-    headers = {"api_key": API_KEY}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        while True:
-            try:
-                async with session.get("https://api.wmata.com/gtfs/bus-gtfsrt-vehiclepositions.pb") as resp:
-                    if resp.status == 200:
-                        content = await resp.read(); feed = gtfs_realtime_pb2.FeedMessage(); feed.ParseFromString(content)
+                # Merge wmata_bus_dict
+                for k in list(state['bus_positions_dict'].keys()):
+                    if k.startswith('wmata_'): del state['bus_positions_dict'][k]
+                state['bus_positions_dict'].update(wmata_bus_dict)
+                
+                # Merge live speeds list
+                for k in list(state['live_speeds_list'].keys()):
+                    if k.startswith('wmata_'): del state['live_speeds_list'][k]
+                state['live_speeds_list'].update(current_speeds_list)
+                
+                for k in list(state['live_speeds'].keys()):
+                    if k.startswith('wmata_'): del state['live_speeds'][k]
+                for stop_id, speeds in current_speeds_list.items():
+                    if speeds:
+                        state['live_speeds'][stop_id] = sum(speeds) / len(speeds)
                         
-                        current_speeds_list = {}
-                        current_buses = {}
-                        wmata_bus_dict = {}
-                        for entity in feed.entity:
-                            if entity.HasField('vehicle'):
-                                v = entity.vehicle
-                                v_id = 'wmata_' + str(v.vehicle.id)
-                                r_id = 'wmata_' + str(v.trip.route_id)
-                                stop_id = 'wmata_' + str(v.stop_id) if v.stop_id else None
-                                
-                                if r_id not in current_buses: current_buses[r_id] = []
-                                current_buses[r_id].append(v_id)
+                # Merge live buses
+                for k in list(state['live_buses'].keys()):
+                    if k.startswith('wmata_'): del state['live_buses'][k]
+                state['live_buses'].update(current_buses)
+                
+                state['last_payload_ts'] = time.time()
+    except Exception as e:
+        print(f"Error in poll_vehicle_positions_once: {e}")
 
-                                speed_mph = (v.position.speed * 2.23694) if v.position.speed else 0
-                                
-                                # Gather live coordinate and movement parameters for mapping
-                                lat = float(v.position.latitude) if v.position.latitude else 0.0
-                                lon = float(v.position.longitude) if v.position.longitude else 0.0
-                                bearing = float(v.position.bearing) if v.position.bearing else 0.0
-                                speed_mps = float(v.position.speed) if v.position.speed else 0.0
-                                timestamp = int(v.timestamp) if v.timestamp else int(time.time())
-                                
-                                t_id = 'wmata_' + str(v.trip.trip_id) if v.trip.trip_id else None
-                                delay_sec = 0
-                                if t_id and 'trip_delays' in state and t_id in state['trip_delays']:
-                                    delay_sec = int(state['trip_delays'][t_id])
-                                elif stop_id and 'gtfs_delays' in state and stop_id in state['gtfs_delays']:
-                                    delay_sec = int(state['gtfs_delays'][stop_id])
-
-                                if lat != 0.0 and lon != 0.0:
-                                    wmata_bus_dict[v_id] = {
-                                        "id": v_id,
-                                        "route": r_id,
-                                        "lat": lat,
-                                        "lon": lon,
-                                        "bearing": bearing,
-                                        "speed": speed_mps,
-                                        "timestamp": timestamp,
-                                        "trip_id": t_id,
-                                        "delay": delay_sec
-                                    }
-
-                                if stop_id:
-                                    if stop_id not in current_speeds_list:
-                                        current_speeds_list[stop_id] = []
-                                    current_speeds_list[stop_id].append(speed_mph)
-                                
-                                # Canary Stats
-                                if v_id in state['canary_buses']:
-                                    canary = state['canary_buses'][v_id]
-                                    if speed_mph < 2.0:
-                                        canary['status'] = "IMPACT CONFIRMED"
-                                        if r_id in state['active_predictions'] and state['active_predictions'][r_id]['t_physical'] is None:
-                                            state['active_predictions'][r_id]['t_physical'] = time.time()
-                                    else:
-                                        canary['status'] = f"Tracking ({speed_mph:.1f}mph)"
-                        
-                        # Merge wmata_bus_dict
-                        for k in list(state['bus_positions_dict'].keys()):
-                            if k.startswith('wmata_'): del state['bus_positions_dict'][k]
-                        state['bus_positions_dict'].update(wmata_bus_dict)
-                        
-                        # Merge live speeds list
-                        for k in list(state['live_speeds_list'].keys()):
-                            if k.startswith('wmata_'): del state['live_speeds_list'][k]
-                        state['live_speeds_list'].update(current_speeds_list)
-                        
-                        # Merge live speeds
-                        for k in list(state['live_speeds'].keys()):
-                            if k.startswith('wmata_'): del state['live_speeds'][k]
-                        for stop_id, speeds in current_speeds_list.items():
-                            if speeds:
-                                state['live_speeds'][stop_id] = sum(speeds) / len(speeds)
-                                
-                        # Merge live buses
-                        for k in list(state['live_buses'].keys()):
-                            if k.startswith('wmata_'): del state['live_buses'][k]
-                        state['live_buses'].update(current_buses)
-                        
-                        state['last_payload_ts'] = time.time()
-            except: pass
-            await asyncio.sleep(15)
-
-async def poll_metrorail_rt():
-    print("🚇 Metrorail Telemetry starting...")
-    headers = {"api_key": API_KEY}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        while True:
-            try:
-                async with session.get("https://api.wmata.com/gtfs/rail-gtfsrt-alerts.pb") as resp:
-                    content = await resp.read(); feed = gtfs_realtime_pb2.FeedMessage(); feed.ParseFromString(content)
-                    alerts = 0
-                    for entity in feed.entity:
-                        if entity.HasField('alert'): alerts += 1
-                    state['rail_alerts'] = alerts
-            except: pass
-            await asyncio.sleep(120)
+async def poll_metrorail_rt_once(session):
+    try:
+        async with session.get("https://api.wmata.com/gtfs/rail-gtfsrt-alerts.pb") as resp:
+            if resp.status == 200:
+                content = await resp.read()
+                feed = gtfs_realtime_pb2.FeedMessage()
+                feed.ParseFromString(content)
+                alerts = 0
+                for entity in feed.entity:
+                    if entity.HasField('alert'): alerts += 1
+                state['rail_alerts'] = alerts
+    except Exception as e:
+        print(f"Error in poll_metrorail_rt_once: {e}")
 
 def haversine(lat1, lon1, lat2, lon2):
     R = 3958.8 # Earth radius in miles
@@ -848,64 +896,63 @@ try:
 except Exception as e:
     print(f"Error loading metro_stations.json: {e}")
 
-async def poll_rail_positions(tree, stops_info, nodes_list):
-    print("🚇 Metrorail Target Acquisition (GPS) starting...")
-    headers = {"api_key": API_KEY}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        while True:
-            try:
-                async with session.get("https://api.wmata.com/gtfs/rail-gtfsrt-vehiclepositions.pb") as resp:
-                    content = await resp.read(); feed = gtfs_realtime_pb2.FeedMessage(); feed.ParseFromString(content)
-                    surges = set()
-                    train_positions = []
-                    
-                    for entity in feed.entity:
-                        if entity.HasField('vehicle'):
-                            v = entity.vehicle
-                            v_id = str(v.vehicle.id)
-                            r_id = str(v.trip.route_id)
-                            stop_id = str(v.stop_id) if v.stop_id else None
-                            
-                            lat = float(v.position.latitude) if v.position.latitude else 0.0
-                            lon = float(v.position.longitude) if v.position.longitude else 0.0
-                            bearing = float(v.position.bearing) if v.position.bearing else 0.0
-                            timestamp = int(v.timestamp) if v.timestamp else int(time.time())
-                            current_status = getattr(v, 'current_status', 2) # Default to IN_TRANSIT_TO
-                            
-                            # Map stop_id to station name
-                            station_name = "Unknown Station"
-                            if stop_id:
-                                parts = stop_id.split('_')
-                                if len(parts) >= 2:
-                                    code = parts[1]
-                                    station_name = metro_stations.get(code, "Unknown Station")
-                            
-                            # Fallback to KDTree snapping to get a nearby surface intersection if station is unknown
-                            if station_name == "Unknown Station" and lat != 0.0 and lon != 0.0:
-                                dist, idx = tree.query([lat, lon])
-                                if dist < 0.005:
-                                    node_id = nodes_list[idx]
-                                    station_name = stops_info.get(node_id, {}).get('name', 'Unknown Station')
-                            
-                            # Speed estimation via coordinate caching & Haversine distance
-                            speed_mph = 0.0
-                            if lat != 0.0 and lon != 0.0:
-                                if current_status == 1: # STOPPED_AT
-                                    speed_mph = 0.0
-                                else:
-                                    prev = state['prev_trains'].get(v_id)
-                                    if prev:
-                                        prev_lat, prev_lon, prev_ts, prev_speed = prev
-                                        dt = timestamp - prev_ts
-                                        if dt > 0:
-                                            dist_miles = haversine(prev_lat, prev_lon, lat, lon)
-                                            speed_mph = (dist_miles / dt) * 3600.0
-                                            if speed_mph > 75.0: # Clamp excessive speed jumps due to GPS telemetry jumps
-                                                speed_mph = prev_speed if prev_speed is not None else 0.0
-                                        else:
+async def poll_rail_positions_once(session, tree, stops_info, nodes_list):
+    try:
+        async with session.get("https://api.wmata.com/gtfs/rail-gtfsrt-vehiclepositions.pb") as resp:
+            if resp.status == 200:
+                content = await resp.read()
+                feed = gtfs_realtime_pb2.FeedMessage()
+                feed.ParseFromString(content)
+                surges = set()
+                train_positions = []
+                
+                for entity in feed.entity:
+                    if entity.HasField('vehicle'):
+                        v = entity.vehicle
+                        v_id = str(v.vehicle.id)
+                        r_id = str(v.trip.route_id)
+                        stop_id = str(v.stop_id) if v.stop_id else None
+                        
+                        lat = float(v.position.latitude) if v.position.latitude else 0.0
+                        lon = float(v.position.longitude) if v.position.longitude else 0.0
+                        bearing = float(v.position.bearing) if v.position.bearing else 0.0
+                        timestamp = int(v.timestamp) if v.timestamp else int(time.time())
+                        current_status = getattr(v, 'current_status', 2) # Default to IN_TRANSIT_TO
+                        
+                        # Map stop_id to station name
+                        station_name = "Unknown Station"
+                        if stop_id:
+                            parts = stop_id.split('_')
+                            if len(parts) >= 2:
+                                code = parts[1]
+                                station_name = metro_stations.get(code, "Unknown Station")
+                        
+                        # Fallback to KDTree snapping to get a nearby surface intersection if station is unknown
+                        if station_name == "Unknown Station" and lat != 0.0 and lon != 0.0:
+                            dist, idx = tree.query([lat, lon])
+                            if dist < 0.005:
+                                node_id = nodes_list[idx]
+                                station_name = stops_info.get(node_id, {}).get('name', 'Unknown Station')
+                        
+                        # Speed estimation via coordinate caching & Haversine distance
+                        speed_mph = 0.0
+                        if lat != 0.0 and lon != 0.0:
+                            if current_status == 1: # STOPPED_AT
+                                speed_mph = 0.0
+                            else:
+                                prev = state['prev_trains'].get(v_id)
+                                if prev:
+                                    prev_lat, prev_lon, prev_ts, prev_speed = prev
+                                    dt = timestamp - prev_ts
+                                    if dt > 0:
+                                        dist_miles = haversine(prev_lat, prev_lon, lat, lon)
+                                        speed_mph = (dist_miles / dt) * 3600.0
+                                        if speed_mph > 75.0: # Clamp excessive speed jumps due to GPS telemetry jumps
                                             speed_mph = prev_speed if prev_speed is not None else 0.0
                                     else:
-                                        speed_mph = (v.position.speed * 2.23694) if (hasattr(v.position, 'speed') and v.position.speed) else 0.0
+                                        speed_mph = prev_speed if prev_speed is not None else 0.0
+                                else:
+                                    speed_mph = (v.position.speed * 2.23694) if (hasattr(v.position, 'speed') and v.position.speed) else 0.0
                                 
                                 state['prev_trains'][v_id] = (lat, lon, timestamp, speed_mph)
                                 
@@ -931,21 +978,127 @@ async def poll_rail_positions(tree, stops_info, nodes_list):
                                     dist, idx = tree.query([v.position.latitude, v.position.longitude])
                                     if dist < 0.005:
                                         surges.add(int(idx))
-                                        
-                    state['rail_surges'] = surges
-                    state['train_positions'] = train_positions
-            except Exception as e:
-                print(f"Error in poll_rail_positions: {e}")
-            await asyncio.sleep(15)
+                                    
+                state['rail_surges'] = surges
+                state['train_positions'] = train_positions
+    except Exception as e:
+        print(f"Error in poll_rail_positions_once: {e}")
 
-def spectral_analysis(W):
-    n = W.shape[0]; D_diag = np.array(W.sum(axis=1)).flatten(); L = sp.diags(D_diag) - W
+class PollingTask:
+    def __init__(self, task_id, interval, priority):
+        self.task_id = task_id
+        self.interval = interval
+        self.priority = priority # 1 (High), 2 (Mid), 3 (Low)
+        self.next_run = 0.0
+
+    def __lt__(self, other):
+        if self.next_run == other.next_run:
+            return self.priority < other.priority
+        return self.next_run < other.next_run
+
+import heapq
+
+async def priority_queue_scheduler(tasks, state, rate_limiter, tree, nodes_list, stops_info, route_to_stops):
+    queue = []
+    now = time.time()
+    for task in tasks:
+        task.next_run = now
+        heapq.heappush(queue, task)
+        
+    async with aiohttp.ClientSession() as session:
+        while True:
+            if not queue:
+                await asyncio.sleep(1.0)
+                continue
+                
+            task = heapq.heappop(queue)
+            now = time.time()
+            
+            if task.next_run > now:
+                heapq.heappush(queue, task)
+                await asyncio.sleep(min(1.0, task.next_run - now))
+                continue
+                
+            url_map = {
+                "weather": WEATHER_URL,
+                "incidents": INCIDENTS_DC,
+                "bikeshare": BIKESHARE_STATUS,
+                "wmata_tu": "https://api.wmata.com/gtfs/bus-gtfsrt-tripupdates.pb",
+                "rideon_vp": f"http://rideon.app/json/GetGtfsRealtimeVehiclePositions?apiKey={os.environ.get('RIDEON_API_KEY', '')}&ClientId={os.environ.get('RIDEON_CLIENT_ID', '')}",
+                "rideon_tu": f"http://rideon.app/json/GetGtfsRealtimeTripUpdates?apiKey={os.environ.get('RIDEON_API_KEY', '')}&ClientId={os.environ.get('RIDEON_CLIENT_ID', '')}",
+                "wmata_alerts": "https://api.wmata.com/gtfs/bus-gtfsrt-alerts.pb",
+                "wmata_vp": "https://api.wmata.com/gtfs/bus-gtfsrt-vehiclepositions.pb",
+                "metrorail_rt": "https://api.wmata.com/gtfs/rail-gtfsrt-alerts.pb",
+                "rail_positions": "https://api.wmata.com/gtfs/rail-gtfsrt-vehiclepositions.pb"
+            }
+            
+            url = url_map.get(task.task_id)
+            if url and not rate_limiter.can_request(url, now):
+                task.next_run = now + 1.0
+                heapq.heappush(queue, task)
+                await asyncio.sleep(0.1)
+                continue
+                
+            if url:
+                rate_limiter.record_request(url, now)
+                
+            try:
+                if task.task_id == 'weather':
+                    await poll_weather_once(session)
+                elif task.task_id == 'incidents':
+                    await poll_incidents_once(session, tree)
+                elif task.task_id == 'bikeshare':
+                    await poll_bikeshare_once(session, tree)
+                elif task.task_id == 'wmata_tu':
+                    await poll_gtfs_rt_once(session)
+                elif task.task_id == 'rideon_vp':
+                    await poll_rideon_vp_once(session, tree, nodes_list)
+                elif task.task_id == 'rideon_tu':
+                    await poll_rideon_tu_once(session)
+                elif task.task_id == 'wmata_alerts':
+                    await poll_alerts_once(session)
+                elif task.task_id == 'wmata_vp':
+                    await poll_vehicle_positions_once(session)
+                elif task.task_id == 'metrorail_rt':
+                    await poll_metrorail_rt_once(session)
+                elif task.task_id == 'rail_positions':
+                    await poll_rail_positions_once(session, tree, stops_info, nodes_list)
+            except Exception as task_err:
+                print(f"Error executing task {task.task_id}: {task_err}")
+                
+            task.next_run = now + task.interval
+            heapq.heappush(queue, task)
+            await asyncio.sleep(0.01)
+
+
+
+def spectral_analysis(W, f=None, v0=None):
+    n = W.shape[0]
+    D_diag = np.array(W.sum(axis=1)).flatten()
+    L = sp.diags(D_diag) - W
+    
+    # Calculate adaptive regularization shift sigma_t
+    if f is not None and len(f) > 0:
+        sigma_t = float(max(1e-5, 1e-3 * np.std(f)))
+    else:
+        sigma_t = 1e-5
+        
+    # Validate v0
+    v0_param = None
+    if v0 is not None and len(v0) == n:
+        v0_param = v0
+        
     try:
-        evals, evecs = eigsh(L, k=3, which='LM', sigma=1e-5, tol=1e-2, maxiter=500)
-        idx = np.argsort(evals); return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
+        evals, evecs = eigsh(L, k=3, which='LM', sigma=sigma_t, tol=1e-2, maxiter=500, v0=v0_param)
+        idx = np.argsort(evals)
+        return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
     except:
-        try: evals, evecs = eigsh(L, k=3, which='SM', tol=1e-1); idx = np.argsort(evals); return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
-        except: return 0, np.zeros(n), 0
+        try:
+            evals, evecs = eigsh(L, k=3, which='SM', tol=1e-1, v0=v0_param)
+            idx = np.argsort(evals)
+            return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
+        except:
+            return 0.0, np.zeros(n), 0.0
 
 async def main_loop(W, nodes_list, node_to_idx, stops_info, tree, route_to_stops):
     W_mask = W.copy(); W_mask.data[:] = 1.0
@@ -971,9 +1124,10 @@ async def main_loop(W, nodes_list, node_to_idx, stops_info, tree, route_to_stops
     # Pre-compute static centrality-adjusted edge thresholds vector to eliminate runtime calculation overhead
     thresholds = 0.4 * (1.0 + GAMMA_CENTRALITY * (1.0 - 0.5 * (C[rows] + C[W_mask.indices])))
     
-    last_v2 = np.zeros(len(nodes_list))
-    last_l2 = 0.001
-    last_gap = 0.001
+    last_v2 = None
+    last_l2 = 0.05
+    last_gap = 0.05
+    last_f = None
     
     while True:
         loop_start = time.time(); state["total_cycles"] += 1
@@ -1022,29 +1176,53 @@ async def main_loop(W, nodes_list, node_to_idx, stops_info, tree, route_to_stops
         # Penalties bleed onto topological neighbors, simulating physical tailbacks upstream of blockages.
         D_inv_W_f = D_inv * (W_mask @ f)
         f = (1.0 - ALPHA_DIFFUSION) * f + ALPHA_DIFFUSION * D_inv_W_f
-        f = np.clip(f, 0.01, 1.0)
+        f = np.clip(smooth_floor(f), 0.01, 1.0)
         
         W = sp.diags(f) @ W_mask @ sp.diags(f)
         
-        try:
-            l2, v2, gap = spectral_analysis(W)
-            if l2 == 0 and np.all(v2 == 0):
-                l2 = last_l2
-                v2 = last_v2
-                gap = last_gap
-                print("⚠️ [Solver Warning] Spectral convergence failed. Using topological fallback values.")
-            else:
-                last_l2 = l2
-                last_v2 = v2
-                last_gap = gap
-        except Exception as solver_err:
+        if last_f is not None:
+            f_diff_l2 = float(np.linalg.norm(f - last_f))
+        else:
+            f_diff_l2 = 1.0
+            
+        if last_f is not None and f_diff_l2 < 1e-3:
             l2 = last_l2
             v2 = last_v2
             gap = last_gap
-            print(f"⚠️ [Solver Exception] Mathematical error: {solver_err}. Using topological fallback values.")
+        else:
+            try:
+                l2, v2, gap = spectral_analysis(W, f, last_v2)
+                if l2 == 0 and np.all(v2 == 0):
+                    l2 = last_l2 if last_l2 is not None else 0.05
+                    v2 = last_v2 if last_v2 is not None else np.zeros(len(nodes_list))
+                    gap = last_gap if last_gap is not None else 0.05
+                    print("⚠️ [Solver Warning] Spectral convergence failed. Using topological fallback values.")
+            except Exception as solver_err:
+                l2 = last_l2 if last_l2 is not None else 0.05
+                v2 = last_v2 if last_v2 is not None else np.zeros(len(nodes_list))
+                gap = last_gap if last_gap is not None else 0.05
+                print(f"⚠️ [Solver Exception] Mathematical error: {solver_err}. Using topological fallback values.")
+
+        last_f = f.copy()
+        last_l2 = l2
+        last_v2 = v2
+        last_gap = gap
 
         lat = (time.time() - loop_start) * 1000
-        state["graph_stats"].update({"compute_latency": lat, "peak_latency": max(state["graph_stats"]["peak_latency"], lat), "avg_friction": np.mean(f), "system_tension": np.std(f), "spectral_gap": gap, "total_delay_sec": total_delay, "fiedler_max": v2[np.argmax(np.abs(v2))], "fiedler_pole_name": stops_info[nodes_list[np.argmax(np.abs(v2))]]['name'], "worst_node_name": stops_info[nodes_list[np.argmin(f)]]['name']})
+        # Safe v2 formatting for graph_stats
+        v2_for_stats = v2 if v2 is not None else np.zeros(len(nodes_list))
+        worst_idx = np.argmin(f)
+        state["graph_stats"].update({
+            "compute_latency": lat, 
+            "peak_latency": max(state["graph_stats"]["peak_latency"], lat), 
+            "avg_friction": np.mean(f), 
+            "system_tension": np.std(f), 
+            "spectral_gap": gap, 
+            "total_delay_sec": total_delay, 
+            "fiedler_max": v2_for_stats[np.argmax(np.abs(v2_for_stats))] if len(v2_for_stats) > 0 else 0.0, 
+            "fiedler_pole_name": stops_info[nodes_list[np.argmax(np.abs(v2_for_stats))]]['name'] if len(v2_for_stats) > 0 else "Core", 
+            "worst_node_name": stops_info[nodes_list[worst_idx]]['name'] if worst_idx < len(nodes_list) else "None"
+        })
         
         # --- FRACTURE DIAGNOSTICS & TARGET ACQUISITION ---
         fractures = []
@@ -1464,17 +1642,25 @@ async def main_loop(W, nodes_list, node_to_idx, stops_info, tree, route_to_stops
         await asyncio.sleep(max(0, POLL_INTERVAL_GTFS - (time.time() - loop_start)))
 
 async def main():
-    init_logger(); W, nodes_list, node_to_idx, stops_info, tree, route_to_stops = load_static_topology()
+    init_logger()
+    W, nodes_list, node_to_idx, stops_info, tree, route_to_stops = load_static_topology()
+    
+    # Instantiate task queue objects
+    tasks = [
+        PollingTask('wmata_vp', 15.0, 1),
+        PollingTask('rail_positions', 15.0, 1),
+        PollingTask('rideon_vp', 20.0, 1),
+        PollingTask('wmata_tu', 30.0, 2),
+        PollingTask('rideon_tu', 20.0, 2),
+        PollingTask('bikeshare', 120.0, 3),
+        PollingTask('metrorail_rt', 120.0, 3),
+        PollingTask('incidents', 300.0, 3),
+        PollingTask('wmata_alerts', 300.0, 3),
+        PollingTask('weather', 900.0, 3)
+    ]
+    
     await asyncio.gather(
-        poll_weather(),
-        poll_incidents(tree),
-        poll_bikeshare(tree),
-        poll_gtfs_rt(),
-        poll_rideon_gtfs_rt(tree, nodes_list),
-        poll_alerts(route_to_stops),
-        poll_vehicle_positions(),
-        poll_metrorail_rt(),
-        poll_rail_positions(tree, stops_info, nodes_list),
+        priority_queue_scheduler(tasks, state, rate_limiter, tree, nodes_list, stops_info, route_to_stops),
         main_loop(W, nodes_list, node_to_idx, stops_info, tree, route_to_stops)
     )
 

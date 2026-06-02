@@ -29,6 +29,23 @@ $$0 = \lambda_1 \le \lambda_2 \le \lambda_3 \le \dots \le \lambda_n$$
 *   **$\lambda_2$ (Algebraic Connectivity / Fiedler Value)**: Mathematically quantifies how easily the network can be partitioned. A high $\lambda_2$ indicates a robust, highly interconnected network where vehicles can easily reroute. As traffic gridlock shatters the grid, $\lambda_2$ drops towards $0.0$. If $\lambda_2 < 10^{-4}$, it indicates that critical bottlenecks have mathematically fractured the network into isolated sub-graphs.
 *   **Spectral Gap ($\lambda_3 - \lambda_2$)**: Measures structural vulnerability. A small spectral gap indicates that the network's algebraic structure is unstable, indicating that minor local disruptions will rapidly cascade into system-wide fractures.
 
+### Eigensolver Optimization and Stability Protocols
+To achieve real-time compute cycles of under $15\text{ milliseconds}$ for the entire DMV network topology graph, the spectral engine utilizes several numerical optimizations and stability guards:
+*   **Event-Driven Eigensolver Gating**: The engine calculates the $L_2$-norm of consecutive friction differences, gating the solver to avoid redundant calculations:
+    $$f_{\text{diff}} = \|f_t - f_{t-1}\|_2$$
+    If $f_{\text{diff}} < \epsilon$ where $\epsilon = 10^{-3}$, the eigensolver is bypassed, and the prior spectral state is reused:
+    $$\lambda_{2, t} = \lambda_{2, t-1}, \quad \vec{v}_{2, t} = \vec{v}_{2, t-1}, \quad \text{gap}_t = \text{gap}_{t-1}$$
+    This filters out stable-state iterations, sparing CPU registers from redundant Lanczos iterations when network dynamics are stagnant.
+*   **Eigensolver Warm-Starting**: When the gating condition is not met (i.e., $f_{\text{diff}} \ge 10^{-3}$), the Fiedler vector $\vec{v}_{2, t-1}$ from the prior cycle is passed as the initial vector `v0` parameter to `scipy.sparse.linalg.eigsh` to warm-start Krylov subspace construction. Passing a high-fidelity estimate of the target eigenvector significantly reduces the number of Arnoldi iterations required to reach the convergence tolerance.
+*   **Adaptive Regularization Shift**: Rather than using a static shift, the engine dynamically sets the regularization shift $\sigma_t$ during spectral analysis:
+    $$\sigma_t = \max\left(10^{-5}, 10^{-3} \cdot \operatorname{std}(f)\right)$$
+    This ensures that when the friction variance is low, the shift remains at a stable numeric baseline ($10^{-5}$), and scales upwards dynamically under high variance to isolate eigenvalues from numerical clustering.
+*   **Smooth Exponential Friction Floor (Softplus Decay)**: To soften matrix rank transitions and stabilize 3D Plotly height rendering, the rigid floor clamp $\max(f, 0.01)$ is replaced by a smooth softplus floor decay function:
+    $$f(x) = \text{smooth\_floor}(x) = \frac{\ln(1 + e^{k x})}{k}$$
+    where $k = 100.0$, implemented piecewise to prevent numerical overflow:
+    $$\text{smooth\_floor}(x) = \begin{cases} x & \text{if } k x > 50.0 \\ \frac{\ln(1 + e^{k x})}{k} & \text{otherwise} \end{cases}$$
+    and then clipped to $[0.01, 1.0]$. This differentiable activation function prevents sharp discontinuities in the friction gradient, stabilizing the sparse eigensolver search.
+
 ---
 
 ## 2. Comprehensive Input Feed Registry ("For & Why" Standard)
@@ -130,6 +147,35 @@ The engine pulls from 8 distinct data feeds asynchronously. Below is the exact t
     2.  **Interval Limit**: Minimum $\Delta t \ge 20\text{ seconds}$ between consecutive queries to the same URL.
     3.  **Overall Limit**: $\le 10$ requests per rolling $60\text{-second}$ window across all URLs.
     The engine alternates requests to the positions and updates endpoints every $15.0\text{ seconds}$, achieving a safe polling interval of $30.0\text{ seconds}$ per link.
+
+### Priority-Driven Ingestion Queue Scheduler
+To orchestrate high-frequency data ingestion without creating thread contention or triggering external API blockades, the engine uses a priority-driven asynchronous scheduler.
+
+All data acquisition tasks are classified into three strict priority tiers managed inside a min-heap queue:
+1.  **High Priority (Tier 1 - Rapid Telemetry)**: Polling cycles critical to real-time rendering and kinematic dead-reckoning animation.
+    -   `wmata_vp` (WMATA Bus Positions): $15\text{-second}$ interval.
+    -   `rail_positions` (Metrorail Positions): $15\text{-second}$ interval.
+    -   `rideon_vp` (RideOn Bus Positions): $20\text{-second}$ interval.
+2.  **Medium Priority (Tier 2 - Schedule Updates)**: Polling cycles capturing schedule deviations.
+    -   `rideon_tu` (RideOn Trip Updates): $20\text{-second}$ interval.
+    -   `wmata_tu` (WMATA Trip Updates): $30\text{-second}$ interval.
+3.  **Low Priority (Tier 3 - Environment & Alerts)**: Slow polling cycles monitoring macro state variables.
+    -   `bikeshare` (Bikeshare Status): $120\text{-second}$ interval.
+    -   `metrorail_rt` (Rail Alerts): $120\text{-second}$ interval.
+    -   `incidents` (Municipal Road Incidents): $300\text{-second}$ interval.
+    -   `wmata_alerts` (Bus Service Alerts): $300\text{-second}$ interval.
+    -   `weather` (Atmospheric Weather): $900\text{-second}$ interval.
+
+#### Min-Heap Scheduling Mechanics
+Tasks are represented by `PollingTask` instances, which define a natural ordering based on their scheduled next execution time $t_{\text{next}}$ and secondary tie-breaking priority level $P$. The ordering relation for two tasks $A$ and $B$ is defined as:
+$$A < B \iff (t_{\text{next}, A} < t_{\text{next}, B}) \lor (t_{\text{next}, A} = t_{\text{next}, B} \land P_A < P_B)$$
+
+The scheduler runs a non-blocking event loop utilizing Python's `heapq` module:
+1.  Popping the task at the root of the min-heap.
+2.  Checking the current epoch time $t_{\text{now}}$. If $t_{\text{next}} > t_{\text{now}}$, the task is pushed back onto the heap, and the loop sleeps for $\min(1.0, t_{\text{next}} - t_{\text{now}})$ seconds.
+3.  Querying the `RateLimiter` class for request clearance. If the request to the target endpoint is blocked due to active rate-limiting windows (e.g., Montgomery County governance policies), the task's next run time is bumped to $t_{\text{now}} + 1.0\text{ second}$, the task is pushed back onto the heap, and the loop continues immediately.
+4.  Executing the asynchronous fetch handler (e.g., `poll_vehicle_positions_once`).
+5.  Updating the task's next run time $t_{\text{next}} \leftarrow t_{\text{now}} + \Delta t_{\text{interval}}$ and pushing the task back onto the heap.
 
 ---
 
@@ -323,13 +369,40 @@ Below is the technical specification of every UI widget, visual layer, and telem
 
 ### 11. Live Transit Buses & Dead-Reckoning Animation
 *   **What it Displays**: Glowing `#00f2ff` cyan markers representing active Metrobuses floating on the map.
-*   **Why it is Displayed**: Provides real-time operational location tracking and kinematic verification. Rather than displaying lagging, static points that "teleport" or "jump" every $15$-second telemetry cycle, the client runs a continuous $500\text{ ms}$ kinematic dead-reckoning loop using the bus's last reported speed $v$, bearing $\theta_{\text{nav}}$, and timestamp to animate movement smoothly.
+*   **Why it is Displayed**: Provides real-time operational location tracking and kinematic verification. Rather than displaying lagging, static points that "teleport" or "jump" every $15$-second telemetry cycle, the client runs a continuous $500\text{ ms}$ kinematic dead-reckoning loop to animate movement smoothly. When shape data is available in `static/shapes.json`, vehicles are snapped to their corresponding geometric shapes and interpolated precisely along the path. Otherwise, the engine falls back to bearing-based planar dead-reckoning.
 *   **Operational Utility**: Verifies vehicle spacing, detects bunched clusters, and confirms movement.
 *   **Mathematical Formula**:
-    We convert the navigational bearing $\theta_{\text{nav}}$ (clockwise from true North) to the planar trigonometric angle $\phi_{\text{rad}}$ (counterclockwise from East):
+    
+    #### A. Shape Snapping
+    Let the geometric shape profile of the transit trip be represented by an ordered sequence of coordinates $P_1, P_2, \dots, P_M$ where $P_i = [\text{lat}_i, \text{lon}_i]^T$.
+    The cumulative distance along the shape at vertex $i$ is defined recursively:
+    $$D_1 = 0, \quad D_i = D_{i-1} + \text{GeodesicDist}(P_{i-1}, P_i) \quad \text{for } 2 \le i \le M$$
+    
+    For a vehicle reported at coordinate $P_{\text{vehicle}} = [\text{lat}_{\text{vehicle}}, \text{lon}_{\text{vehicle}}]^T$, the closest point on the segment connecting $P_i$ and $P_{i+1}$ is computed by projecting $P_{\text{vehicle}}$ onto the segment:
+    $$t_i = \operatorname{clamp}\left( \frac{(P_{\text{vehicle}} - P_i) \cdot (P_{i+1} - P_i)}{\|P_{i+1} - P_i\|^2}, 0, 1 \right)$$
+    
+    The snapped coordinate $P_{\text{snap}, i}$ for segment $i$ is:
+    $$P_{\text{snap}, i} = P_i + t_i (P_{i+1} - P_i)$$
+    
+    The global snapped position $P_{\text{snap}}$ minimizes the Euclidean distance:
+    $$i^* = \operatorname{arg\,min}_{1 \le i < M} \|P_{\text{vehicle}} - P_{\text{snap}, i}\|^2$$
+    $$P_{\text{snap}} = P_{\text{snap}, i^*}$$
+    
+    The initial distance of the vehicle along the shape is:
+    $$d_{\text{start}} = D_{i^*} + t_{i^*} \cdot \text{GeodesicDist}(P_{i^*}, P_{i^*+1})$$
+
+    #### B. Shape Interpolation
+    Using the elapsed time $\Delta t$ since the last telemetry poll and the reported velocity $v$ in meters per second, the target distance along the shape is:
+    $$d_t = \min\left( d_{\text{start}} + v \cdot \Delta t, D_M \right)$$
+    
+    The interpolated coordinate $P(d_t)$ is found by identifying the segment $k$ such that $D_k \le d_t \le D_{k+1}$:
+    $$P(d_t) = P_k + \frac{d_t - D_k}{D_{k+1} - D_k} (P_{k+1} - P_k)$$
+
+    #### C. Bearing-Based Fallback
+    If shape data is not available, the engine falls back to flat-earth Mercator projection. We convert the navigational bearing $\theta_{\text{nav}}$ (clockwise from true North) to the planar trigonometric angle $\phi_{\text{rad}}$ (counterclockwise from East):
     $$\phi_{\text{rad}} = (90^{\circ} - \theta_{\text{nav}}) \times \frac{\pi}{180}$$
 
-    Using the elapsed time $\Delta t$ since the last telemetry poll and the reported velocity $v$ in meters per second, the flat-earth Mercator geographic displacement is computed as:
+    Using the elapsed time $\Delta t$ since the last telemetry poll and the reported velocity $v$ in meters per second, the Mercator geographic displacement is computed as:
     $$\Delta \text{lat} = \frac{v \cdot \Delta t \cdot \sin(\phi_{\text{rad}})}{111139}$$
     $$\Delta \text{lon} = \frac{v \cdot \Delta t \cdot \cos(\phi_{\text{rad}})}{111139 \cdot \cos\left(\text{lat}_{\text{start}} \cdot \frac{\pi}{180}\right)}$$
 
@@ -337,6 +410,7 @@ Below is the technical specification of every UI widget, visual layer, and telem
     $$\text{lon}(t) = \text{lon}_{\text{start}} + \Delta \text{lon}$$
     $$\text{lat}(t) = \text{lat}_{\text{start}} + \Delta \text{lat}$$
 
+    #### D. 3D Repelled Height
     For 3D projection, the bus snaps to the nearest stop node's algebraic isolation height $z_{j^*}$ plus a floating visual buffer $\delta_z$:
     $$z_{\text{bus}} = z_{j^*} + \delta_z \quad \text{where} \quad \delta_z = 0.02$$
 
@@ -450,6 +524,16 @@ The augmented edge set $E_{\text{aug}}$ comprises four distinct edge typologies:
     $$d_{\text{geodesic}}(w, r) = \sqrt{\left(\frac{\pi}{180}(\text{lat}_w - \text{lat}_r)\right)^2 + \cos^2\left(\frac{\pi}{180}\frac{\text{lat}_w + \text{lat}_r}{2}\right) \left(\frac{\pi}{180}(\text{lon}_w - \text{lon}_r)\right)^2} \cdot R_{\text{earth}}$$
     where $R_{\text{earth}} = 6,371,000\text{ meters}$. Bidirectional walking transfer edges are injected if and only if they satisfy the conditional snapping check:
     $$d_{\text{geodesic}}(w, r) \le 150.0 \text{ meters}$$
+    
+    -   **Obstacle-Aware Walk-Transfer Filtering**: To prevent invalid transfers that cross unbridgeable water hazards, the engine filters all candidate walking transfer edges using a 2D line segment intersection algorithm against defined river barriers (the Potomac River barrier set $\mathcal{B}_{\text{Potomac}}$ and the Anacostia River barrier set $\mathcal{B}_{\text{Anacostia}}$).
+        
+        Let $P_w = [w_{\text{lat}}, w_{\text{lon}}]^T$ and $P_r = [r_{\text{lat}}, r_{\text{lon}}]^T$ represent the coordinates of the WMATA and RideOn stops, respectively. For each segment $AB$ representing a river boundary vector (where $A = [A_{\text{lat}}, A_{\text{lon}}]^T$ and $B = [B_{\text{lat}}, B_{\text{lon}}]^T$), the engine computes the counterclockwise (CCW) orientation function:
+        $$\operatorname{ccw}(X, Y, Z) = (z_{\text{lat}} - x_{\text{lat}})(y_{\text{lon}} - x_{\text{lon}}) > (y_{\text{lat}} - x_{\text{lat}})(z_{\text{lon}} - x_{\text{lon}})$$
+        
+        A walking segment $P_w P_r$ intersects river boundary segment $AB$ if and only if the orientation of the endpoints satisfies:
+        $$\operatorname{ccw}(P_w, A, B) \neq \operatorname{ccw}(P_r, A, B) \quad \text{and} \quad \text{ccw}(P_w, P_r, A) \neq \operatorname{ccw}(P_w, P_r, B)$$
+        
+        If this condition is met for any segment $AB \in \mathcal{B}_{\text{Potomac}} \cup \mathcal{B}_{\text{Anacostia}}$, the candidate walking edge is rejected. This prevents the routing engine from proposing physically impossible walks across the Potomac and Anacostia rivers.
 
 ### B. Friction-Deformed Edge Cost Calculations
 The edge weights in the sparse adjacency matrix are defined in units of travel time (seconds), dynamically adjusted based on real-time friction and atmospheric telemetry:

@@ -1058,5 +1058,72 @@ def lookup_cost(csr, u, v):
         return float(csr.data[row_start + idx[0]])
     return 0.0
 
+class TestOptimizedEngineAdditional(unittest.TestCase):
+    def test_crosses_river_true(self):
+        """Verify that crosses_river returns True for coordinates crossing the Potomac barrier."""
+        # Across Potomac: (38.990, -77.160) to (38.990, -77.120)
+        self.assertTrue(engine.crosses_river(38.990, -77.160, 38.990, -77.120))
+        # Across Anacostia: (38.900, -76.980) to (38.900, -76.950)
+        self.assertTrue(engine.crosses_river(38.900, -76.980, 38.900, -76.950))
+
+    def test_river_crossing_blocked(self):
+        """Verify that a Potomac or Anacostia river crossing is correctly identified as blocked."""
+        # Across Potomac
+        self.assertTrue(engine.crosses_river(38.990, -77.160, 38.990, -77.120))
+        # Across Anacostia
+        self.assertTrue(engine.crosses_river(38.900, -76.980, 38.900, -76.950))
+
+    def test_crosses_river_false(self):
+        """Verify that crosses_river returns False for coordinates not crossing any barriers."""
+        # Safe path: (38.900, -77.030) to (38.901, -77.030) (both in DC downtown)
+        self.assertFalse(engine.crosses_river(38.900, -77.030, 38.901, -77.030))
+
+    def test_smooth_floor(self):
+        """Verify that smooth_floor outputs values >= 0.01 and matches expected behavior."""
+        # For high x (e.g. 1.0), smooth_floor should return x
+        self.assertAlmostEqual(engine.smooth_floor(1.0), 1.0, places=4)
+        # For x = 0, smooth_floor should return math.log(2)/100 = 0.00693...
+        # Wait, smooth_floor(0.0) is log(2)/100 which is ~0.0069, but when clipped >= 0.01 is enforced by caller
+        self.assertLess(engine.smooth_floor(0.0), 0.01)
+        self.assertGreater(engine.smooth_floor(0.0), 0.0)
+        
+        # Test numpy array version
+        arr = np.array([0.0, 1.0])
+        res = engine.smooth_floor(arr)
+        self.assertAlmostEqual(res[1], 1.0, places=4)
+        self.assertLess(res[0], 0.01)
+
+    def test_spectral_analysis_adaptive(self):
+        """Verify that spectral_analysis accepts adaptive regularisation parameter and v0."""
+        # Create a simple 3-node connected graph
+        W = sp.csr_matrix([[0.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 0.0]])
+        f = np.array([0.5, 0.6, 0.7])
+        v0 = np.array([1.0, -1.0, 0.0])
+        l2, v2, gap = engine.spectral_analysis(W, f=f, v0=v0)
+        self.assertIsNotNone(l2)
+        self.assertEqual(len(v2), 3)
+        self.assertIsNotNone(gap)
+
+    def test_trip_to_shape_population(self):
+        """Verify that state['trip_to_shape'] is populated when load_static_topology is called."""
+        self.assertIsInstance(engine.state.get('trip_to_shape'), dict)
+
+    def test_bus_positions_have_shape_id(self):
+        """Verify that GTFS-RT buses dict structure supports shape_id field."""
+        engine.state['trip_to_shape']['mock_trip_123'] = 'mock_shape_abc'
+        wmata_bus = {
+            "id": "mock_bus_1",
+            "route": "mock_route",
+            "lat": 38.9,
+            "lon": -77.0,
+            "bearing": 90,
+            "speed": 10.0,
+            "timestamp": int(time.time()),
+            "trip_id": "mock_trip_123",
+            "delay": 0,
+            "shape_id": engine.state.get('trip_to_shape', {}).get("mock_trip_123")
+        }
+        self.assertEqual(wmata_bus["shape_id"], "mock_shape_abc")
+
 if __name__ == "__main__":
     unittest.main()

@@ -523,6 +523,100 @@
             return closestZ;
         }
 
+        let staticShapes = {};
+
+        async function loadStaticShapes() {
+            try {
+                const resp = await fetch('static/shapes.json?t=' + new Date().getTime());
+                if (resp.ok) {
+                    staticShapes = await resp.json();
+                    console.log("🚌 Static Shapes Loaded:", Object.keys(staticShapes).length);
+                }
+            } catch(e) {
+                console.error("Failed to load static shapes:", e);
+            }
+        }
+
+        function getDistanceMeters(lat1, lon1, lat2, lon2) {
+            const dlat = (lat2 - lat1) * Math.PI / 180.0;
+            const dlon = (lon2 - lon1) * Math.PI / 180.0;
+            const latMid = ((lat1 + lat2) / 2.0) * Math.PI / 180.0;
+            return Math.sqrt(dlat**2 + (Math.cos(latMid) * dlon)**2) * 6371000.0;
+        }
+
+        function snapToShape(lat, lon, shapeCoords) {
+            if (!shapeCoords || shapeCoords.length === 0) return { lat, lon, distAlongShape: 0 };
+            
+            let cumDists = [0];
+            for (let i = 1; i < shapeCoords.length; i++) {
+                cumDists.push(cumDists[i-1] + getDistanceMeters(shapeCoords[i-1][0], shapeCoords[i-1][1], shapeCoords[i][0], shapeCoords[i][1]));
+            }
+            
+            let minDistance = Infinity;
+            let bestLat = lat;
+            let bestLon = lon;
+            let bestDistAlong = 0;
+            
+            for (let i = 0; i < shapeCoords.length - 1; i++) {
+                const A = shapeCoords[i];
+                const B = shapeCoords[i+1];
+                
+                const dy = B[0] - A[0];
+                const dx = B[1] - A[1];
+                const lenSq = dy*dy + dx*dx;
+                
+                let t = 0;
+                if (lenSq > 1e-12) {
+                    t = ((lat - A[0]) * dy + (lon - A[1]) * dx) / lenSq;
+                    t = Math.max(0, Math.min(1, t));
+                }
+                
+                const snapLat = A[0] + t * dy;
+                const snapLon = A[1] + t * dx;
+                
+                const distSq = (lat - snapLat)**2 + (lon - snapLon)**2;
+                if (distSq < minDistance) {
+                    minDistance = distSq;
+                    bestLat = snapLat;
+                    bestLon = snapLon;
+                    
+                    const segLen = getDistanceMeters(A[0], A[1], B[0], B[1]);
+                    bestDistAlong = cumDists[i] + t * segLen;
+                }
+            }
+            
+            return {
+                lat: bestLat,
+                lon: bestLon,
+                distAlongShape: bestDistAlong
+            };
+        }
+
+        function interpolateAlongShape(d, shapeCoords) {
+            if (!shapeCoords || shapeCoords.length === 0) return null;
+            if (shapeCoords.length === 1 || d <= 0) return { lat: shapeCoords[0][0], lon: shapeCoords[0][1] };
+            
+            let cumDist = 0;
+            for (let i = 0; i < shapeCoords.length - 1; i++) {
+                const A = shapeCoords[i];
+                const B = shapeCoords[i+1];
+                const segLen = getDistanceMeters(A[0], A[1], B[0], B[1]);
+                
+                if (cumDist + segLen >= d) {
+                    const remaining = d - cumDist;
+                    const t = segLen > 0 ? remaining / segLen : 0;
+                    return {
+                        lat: A[0] + t * (B[0] - A[0]),
+                        lon: A[1] + t * (B[1] - A[1])
+                    };
+                }
+                cumDist += segLen;
+            }
+            
+            const last = shapeCoords[shapeCoords.length - 1];
+            return { lat: last[0], lon: last[1] };
+        }
+
         function getNodeZ(lon, lat, data) {
             if (currentViewMode === '3D_SPECTRAL') {
                 return findClosestNodeZ(lon, lat, data);
@@ -1112,16 +1206,26 @@
                     const currentIds = new Set();
                     data.buses.forEach(b => {
                         currentIds.add(b.id);
+                        let lat = b.lat;
+                        let lon = b.lon;
+                        let shapeId = b.shape_id;
+                        let snapped = null;
+                        if (shapeId && staticShapes[shapeId]) {
+                            snapped = snapToShape(lat, lon, staticShapes[shapeId]);
+                        }
+
                         activeBuses[b.id] = {
                             id: b.id,
                             route: b.route,
-                            startLat: b.lat,
-                            startLon: b.lon,
-                            extrapolatedLat: b.lat,
-                            extrapolatedLon: b.lon,
+                            startLat: snapped ? snapped.lat : lat,
+                            startLon: snapped ? snapped.lon : lon,
+                            extrapolatedLat: snapped ? snapped.lat : lat,
+                            extrapolatedLon: snapped ? snapped.lon : lon,
                             bearing: b.bearing,
                             speed: b.speed,
-                            lastUpdate: Date.now()
+                            lastUpdate: Date.now(),
+                            shapeId: shapeId,
+                            distAlongShape: snapped ? snapped.distAlongShape : null
                         };
                     });
                     // Remove inactive buses
@@ -1661,7 +1765,7 @@
         }
 
         // Initialize Plotly once, then start polling
-        loadMetroTunnels().then(() => {
+        Promise.all([loadMetroTunnels(), loadStaticShapes()]).then(() => {
             fetchAndUpdate().then(() => {
                 // Bind Autocomplete controls once elements and data are loaded
                 bindAutocomplete('route-start-search', 'route-start-results', 'start');
@@ -1750,18 +1854,29 @@
                     let elapsed = (now - b.lastUpdate) / 1000.0;
                     if (elapsed > 30.0) elapsed = 30.0; // Math clamp ceiling
                     
-                    // Convert bearing to planar angle in radians
-                    let phiRad = (90.0 - b.bearing) * Math.PI / 180.0;
-                    
-                    // Integrated kinematic displacement: d = v * t
                     let distM = b.speed * elapsed;
                     
-                    // Project displacement onto flat-earth Mercator coordinate scaling
-                    let latOffset = (distM * Math.sin(phiRad)) / 111139.0;
-                    let lonOffset = (distM * Math.cos(phiRad)) / (111139.0 * Math.cos(b.startLat * Math.PI / 180.0));
-                    
-                    b.extrapolatedLat = b.startLat + latOffset;
-                    b.extrapolatedLon = b.startLon + lonOffset;
+                    if (b.shapeId && staticShapes[b.shapeId]) {
+                        let d_t = (b.distAlongShape || 0) + distM;
+                        let coords = staticShapes[b.shapeId];
+                        let pt = interpolateAlongShape(d_t, coords);
+                        if (pt) {
+                            b.extrapolatedLat = pt.lat;
+                            b.extrapolatedLon = pt.lon;
+                        } else {
+                            let phiRad = (90.0 - b.bearing) * Math.PI / 180.0;
+                            let latOffset = (distM * Math.sin(phiRad)) / 111139.0;
+                            let lonOffset = (distM * Math.cos(phiRad)) / (111139.0 * Math.cos(b.startLat * Math.PI / 180.0));
+                            b.extrapolatedLat = b.startLat + latOffset;
+                            b.extrapolatedLon = b.startLon + lonOffset;
+                        }
+                    } else {
+                        let phiRad = (90.0 - b.bearing) * Math.PI / 180.0;
+                        let latOffset = (distM * Math.sin(phiRad)) / 111139.0;
+                        let lonOffset = (distM * Math.cos(phiRad)) / (111139.0 * Math.cos(b.startLat * Math.PI / 180.0));
+                        b.extrapolatedLat = b.startLat + latOffset;
+                        b.extrapolatedLon = b.startLon + lonOffset;
+                    }
                     changedBuses = true;
                 }
             }

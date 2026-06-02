@@ -9,6 +9,51 @@ import scipy.sparse as sp
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import KDTree
 
+POTOMAC_BARRIER = [
+    ((38.995, -77.162), (38.960, -77.130)),
+    ((38.960, -77.130), (38.930, -77.115)),
+    ((38.930, -77.115), (38.900, -77.070)),
+    ((38.900, -77.070), (38.888, -77.060)),
+    ((38.888, -77.060), (38.875, -77.043)),
+    ((38.875, -77.043), (38.850, -77.040)),
+    ((38.850, -77.040), (38.790, -77.035))
+]
+
+ANACOSTIA_BARRIER = [
+    ((38.935, -76.940), (38.915, -76.955)),
+    ((38.915, -76.955), (38.900, -76.965)),
+    ((38.900, -76.965), (38.875, -76.980)),
+    ((38.875, -76.980), (38.860, -77.010)),
+    ((38.860, -77.010), (38.858, -77.025))
+]
+
+def ccw(A, B, C):
+    return (C[0] - A[0]) * (B[1] - A[1]) > (B[0] - A[0]) * (C[1] - A[1])
+
+def segments_intersect(A, B, C, D):
+    return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+
+def crosses_river(lat1, lon1, lat2, lon2):
+    p1 = (lat1, lon1)
+    p2 = (lat2, lon2)
+    for seg in POTOMAC_BARRIER:
+        if segments_intersect(p1, p2, seg[0], seg[1]):
+            return True
+    for seg in ANACOSTIA_BARRIER:
+        if segments_intersect(p1, p2, seg[0], seg[1]):
+            return True
+    return False
+
+def smooth_floor(x, k=100.0):
+    if isinstance(x, np.ndarray):
+        kx = k * x
+        return np.where(kx > 50.0, x, np.log1p(np.exp(np.clip(kx, -50.0, 50.0))) / k)
+    else:
+        kx = k * x
+        if kx > 50.0:
+            return x
+        return math.log1p(math.exp(kx)) / k
+
 PORT = 8501
 DIRECTORY = "."
 
@@ -134,8 +179,8 @@ def load_and_augment_graph():
     lat_mid = np.radians((lat_u + lat_v) / 2.0)
     dist_meters = np.sqrt(dlat**2 + (np.cos(lat_mid) * dlon)**2) * 6371000.0
     
-    f_u = np.clip(node_friction[rows], 0.01, 1.0)
-    f_v = np.clip(node_friction[cols], 0.01, 1.0)
+    f_u = np.clip(smooth_floor(node_friction[rows]), 0.01, 1.0)
+    f_v = np.clip(smooth_floor(node_friction[cols]), 0.01, 1.0)
     street_costs = dist_meters / (13.4 * f_u * f_v)
     street_costs_clear = dist_meters / 13.4
     
@@ -209,10 +254,11 @@ def load_and_augment_graph():
                 dist_m = math.sqrt(dlat**2 + (math.cos(lat_mid) * dlon)**2) * 6371000.0
                 
                 if dist_m <= 150.0:
-                    edges_from.extend([w_idx, r_idx])
-                    edges_to.extend([r_idx, w_idx])
-                    edges_cost.extend([transfer_penalty_sec, transfer_penalty_sec])
-                    clear_edges_cost.extend([transfer_penalty_clear, transfer_penalty_clear])
+                    if not crosses_river(r_lat, r_lon, w_lat, w_lon):
+                        edges_from.extend([w_idx, r_idx])
+                        edges_to.extend([r_idx, w_idx])
+                        edges_cost.extend([transfer_penalty_sec, transfer_penalty_sec])
+                        clear_edges_cost.extend([transfer_penalty_clear, transfer_penalty_clear])
                     
     aug_num_nodes = N_street + N_rail
     aug_cost_matrix = sp.csr_matrix((edges_cost, (edges_from, edges_to)), shape=(aug_num_nodes, aug_num_nodes))
