@@ -170,6 +170,13 @@ Once both processes are active, navigate to **`http://localhost:8501`** in your 
 
 ---
 
+## 📚 Developer Guides
+
+*   [Extending Feeds and Sensors](docs/extending_feeds.md): Learn how to add new dynamic feeds or physical sensors, update friction penalties, and recalculate Laplacian weights.
+*   [Porting to Other Cities](docs/adapting_transit_systems.md): A step-by-step blueprint on adapting the Graph Laplacian engine and WebGL visualizer to NYC (MTA) or other transit networks around the country.
+
+---
+
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
