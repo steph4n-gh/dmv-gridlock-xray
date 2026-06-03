@@ -27,6 +27,7 @@ server.log
 static/live_data.json
 static/manifest.json
 static/stops_list.json
+static/shapes.json
 static/history/
 
 # Static GTFS data feeds (fused at startup)

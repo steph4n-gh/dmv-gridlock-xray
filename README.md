@@ -20,7 +20,25 @@ Every 30 seconds, the engine builds a dynamic Graph Laplacian from live transit,
 
 | 3D Spectral Topology Visualization | Multimodal Gridlock Diagnostics HUD | Canary Fleet Command HUD |
 |:---:|:---:|:---:|
-| ![3D Spectral Topology](docs/screenshots/media__1780429164336.png) | ![Multimodal Diagnostics HUD](docs/screenshots/media__1780429193678.jpg) | ![Canary Fleet Command](docs/screenshots/media__1780429190580.png) |
+| ![3D Spectral Topology](docs/screenshots/spectral_star_topology.jpg) | ![Multimodal Diagnostics HUD](docs/screenshots/map_full_network.jpg) | ![Canary Fleet Command](docs/screenshots/cli_dashboard.png) |
+
+### 🗺️ Local Area & Network Core Views
+
+| Rockville Pike & Nicholson Lane View | Washington D.C. Core Network View |
+|:---:|:---:|
+| ![Rockville Pike Map](docs/screenshots/map_rockville_pike.jpg) | ![DC Core Map](docs/screenshots/map_dc_core.jpg) |
+
+### 🎛️ HUD Panels & Fleet Command Views
+
+| Map Legend | Dynamic HUD Panels | Metrorail Fleet Command |
+|:---:|:---:|:---:|
+| ![Map Legend](docs/screenshots/map_legend.png) | ![HUD Panels](docs/screenshots/hud_panels.png) | ![Metrorail Fleet Command](docs/screenshots/metrorail_fleet_command.png) |
+
+### 🚲 Bikeshare & Network Topology Details
+
+| Bikeshare Station Depletion | Wide Area Network Overview |
+|:---:|:---:|
+| ![Bikeshare Station Depletion](docs/screenshots/map_bikeshare_depletion.png) | ![Wide Area Network Overview](docs/screenshots/map_network_overview.png) |
 
 ---
 
