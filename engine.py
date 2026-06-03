@@ -95,6 +95,11 @@ class RateLimiter:
         self.overall_history = [] # list of timestamps
         self.load_state()
 
+    def _sanitize_url(self, url):
+        if not url:
+            return ""
+        return url.split("?")[0]
+
     def load_state(self):
         if os.path.exists(self.state_file):
             try:
@@ -112,6 +117,7 @@ class RateLimiter:
                 self.link_history = {}
                 if isinstance(raw_link_history, dict):
                     for url, timestamps in raw_link_history.items():
+                        sanitized_url = self._sanitize_url(url)
                         if isinstance(timestamps, list):
                             valid_ts = []
                             for t in timestamps:
@@ -120,7 +126,10 @@ class RateLimiter:
                                 except (ValueError, TypeError):
                                     pass
                             if valid_ts:
-                                self.link_history[str(url)] = valid_ts
+                                if sanitized_url not in self.link_history:
+                                    self.link_history[sanitized_url] = []
+                                self.link_history[sanitized_url].extend(valid_ts)
+                                self.link_history[sanitized_url].sort()
                                 
                 self.overall_history = []
                 if isinstance(raw_overall_history, list):
@@ -163,8 +172,9 @@ class RateLimiter:
         if now is None: now = time.time()
         self.clean_history(now)
         
+        sanitized_url = self._sanitize_url(url)
         # Rule 1: <= 3 requests/min/link
-        url_history = self.link_history.get(url, [])
+        url_history = self.link_history.get(sanitized_url, [])
         if len(url_history) >= 3: return False
         
         # Rule 2: min 20s interval between consecutive requests to same link
@@ -177,8 +187,9 @@ class RateLimiter:
 
     def record_request(self, url, now=None):
         if now is None: now = time.time()
-        if url not in self.link_history: self.link_history[url] = []
-        self.link_history[url].append(now)
+        sanitized_url = self._sanitize_url(url)
+        if sanitized_url not in self.link_history: self.link_history[sanitized_url] = []
+        self.link_history[sanitized_url].append(now)
         self.overall_history.append(now)
         self.clean_history(now)
         self.save_state()
