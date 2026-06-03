@@ -148,6 +148,11 @@ The engine pulls from 8 distinct data feeds asynchronously. Below is the exact t
     3.  **Overall Limit**: $\le 10$ requests per rolling $60\text{-second}$ window across all URLs.
     The engine alternates requests to the positions and updates endpoints every $15.0\text{ seconds}$, achieving a safe polling interval of $30.0\text{ seconds}$ per link.
 
+    **Defensive Cryptographic Key Sanitization**:
+    To prevent sensitive credentials (e.g., query-parameter-based API keys or client IDs) from leaking into persistent system state, the `RateLimiter` enforces query-level truncation. Before a target URL $U$ is logged or written to the `rate_limit_state.json` file, it undergoes mapping to its base logical endpoint:
+    $$\text{Sanitize}(U) = U_{\text{base}} \quad \text{where } U = U_{\text{base}} \mathbin{?} \text{params}$$
+    This guarantees that rate limits are enforced against logical server endpoints while keeping persisted logs clean of sensitive tokens.
+
 ### Priority-Driven Ingestion Queue Scheduler
 To orchestrate high-frequency data ingestion without creating thread contention or triggering external API blockades, the engine uses a priority-driven asynchronous scheduler.
 

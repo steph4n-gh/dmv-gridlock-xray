@@ -240,7 +240,7 @@ class TestDMVGridlockXRays(unittest.TestCase):
         """Tier 1: Verify overall requests under 10 req/min are allowed."""
         limiter = engine.RateLimiter(state_file=os.path.join(self.tmp_dir, "rl.json"))
         for i in range(5):
-            url = f"http://rideon.app/protobuf/GetGtfsRealtime?link={i}"
+            url = f"http://rideon.app/protobuf/GetGtfsRealtime/{i}"
             self.assertTrue(limiter.can_request(url, now=1000.0 + i))
             limiter.record_request(url, now=1000.0 + i)
 
@@ -590,15 +590,16 @@ class TestDMVGridlockXRays(unittest.TestCase):
         self.assertEqual(limiter.link_history, {})
 
     def test_r2_unicode_or_query_variations(self):
-        """Tier 2: Check query parameter variations are tracked as distinct link targets."""
+        """Tier 2: Check query parameters are sanitized and treated as the same base link target."""
         limiter = engine.RateLimiter(state_file=os.path.join(self.tmp_dir, "rl.json"))
         url1 = "http://rideon.app/protobuf?apiKey=α"
         url2 = "http://rideon.app/protobuf?apiKey=β"
         
         limiter.record_request(url1, now=1000.0)
-        # Even if url1 is locked out by 20s interval, url2 should still be requestable
+        # Both url1 and url2 should map to the same base URL, meaning url2 is locked out by the 20s interval
         self.assertFalse(limiter.can_request(url1, now=1010.0))
-        self.assertTrue(limiter.can_request(url2, now=1010.0))
+        self.assertFalse(limiter.can_request(url2, now=1010.0))
+        self.assertIn("http://rideon.app/protobuf", limiter.link_history)
 
 
     # --- Feature 3: Static Topology Fusion (R3) ---
