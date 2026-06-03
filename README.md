@@ -28,6 +28,18 @@ Every 30 seconds, the engine builds a dynamic Graph Laplacian from live transit,
 |:---:|:---:|
 | ![Rockville Pike Map](docs/screenshots/map_rockville_pike.jpg) | ![DC Core Map](docs/screenshots/map_dc_core.jpg) |
 
+### 🎛️ HUD Panels & Fleet Command Views
+
+| Map Legend | Dynamic HUD Panels | Metrorail Fleet Command |
+|:---:|:---:|:---:|
+| ![Map Legend](docs/screenshots/map_legend.png) | ![HUD Panels](docs/screenshots/hud_panels.png) | ![Metrorail Fleet Command](docs/screenshots/metrorail_fleet_command.png) |
+
+### 🚲 Bikeshare & Network Topology Details
+
+| Bikeshare Station Depletion | Wide Area Network Overview |
+|:---:|:---:|
+| ![Bikeshare Station Depletion](docs/screenshots/map_bikeshare_depletion.png) | ![Wide Area Network Overview](docs/screenshots/map_network_overview.png) |
+
 ---
 
 
