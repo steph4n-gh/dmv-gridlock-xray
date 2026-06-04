@@ -44,7 +44,7 @@ To achieve real-time compute cycles of under $15\text{ milliseconds}$ for the en
     $$f(x) = \text{smooth\_floor}(x) = \frac{\ln(1 + e^{k x})}{k}$$
     where $k = 100.0$, implemented piecewise to prevent numerical overflow:
     $$\text{smooth\_floor}(x) = \begin{cases} x & \text{if } k x > 50.0 \\ \frac{\ln(1 + e^{k x})}{k} & \text{otherwise} \end{cases}$$
-    and then clipped to $[0.01, 1.0]$. This differentiable activation function prevents sharp discontinuities in the friction gradient, stabilizing the sparse eigensolver search.
+    and then clipped to $[0.01, 1.0]$. This differentiable activation function prevents sharp discontinuities in the friction gradient, stabilizing the sparse eigensolver search. To ensure type-safety, the function dynamically accepts list and tuple structures, converting them to NumPy arrays before evaluating.
 
 ---
 
@@ -212,6 +212,23 @@ To maintain numerical stability in the sparse eigensolver, we enforce a hard flo
 $$f_i = \max(f_i, 0.01)$$
 
 *   **Why**: If $f_i$ drops to $0.0$, the diagonal scaling matrix becomes singular (rank-deficient). This collapses the eigenvalues to zero, crashing the sparse eigensolver (`eigsh`). A floor of $0.01$ preserves numerical stability while still representing a 99% flow reduction.
+
+### Coordinate Validation and DMV Bounding Box Guard
+To prevent out-of-bounds spatial queries (e.g., malformed inputs or coordinates representing default/empty numeric states such as `0.0`) from polluting the snap tree calculations, the engine and API router enforce strict geographic bounding box validation. 
+
+A coordinate pair $(\text{lat}, \text{lon})$ is defined as valid if and only if it lies within the DMV regional bounding box $B_{\text{DMV}}$:
+$$(\text{lat}, \text{lon}) \in B_{\text{DMV}} \iff \text{lat}_{\min} \le \text{lat} \le \text{lat}_{\max} \land \text{lon}_{\min} \le \text{lon} \le \text{lon}_{\max}$$
+where:
+*   $\text{lat}_{\min} = 38.0^{\circ}$
+*   $\text{lat}_{\max} = 40.0^{\circ}$
+*   $\text{lon}_{\min} = -78.0^{\circ}$
+*   $\text{lon}_{\max} = -76.0^{\circ}$
+
+To handle arbitrary argument types dynamically submitted to the route API, coordinate parameters undergo strict type casting. The function `validate_coordinates` wraps parsing and conversion inside a `try...except (ValueError, TypeError)` block, automatically returning `False` on parsing failure. It explicitly rejects special float values like `NaN` and `Infinity` (utilizing `math.isnan` and `math.isinf`), as well as raw boolean types which could bypass standard numeric bounds checks.
+
+Additionally, to prevent unhandled parsing errors from causing server-side failures, the `/api/route` endpoint explicitly catches `json.JSONDecodeError` when decoding incoming JSON request payloads. If a malformed payload is intercepted, it is logged to `server.log` with a full traceback and the server responds immediately with a `400 Bad Request` code and a JSON response: `{"status": "error", "message": "Invalid JSON payload"}`.
+
+*   **Why**: Snapping queries to a KDTree for points outside the network's domain produces degenerate closest-neighbor snaps (e.g., snapping a coordinate at `(0.0, 0.0)` in the Atlantic Ocean to the southern-most stop in the DMV network). Checking coordinates against $B_{\text{DMV}}$ before snapping guards the engine's query integrity. Any coordinate failing this check is immediately rejected with HTTP status code 400.
 
 ### Spatial Friction Diffusion (Graph Heat Kernel)
 Transit congestion spreads backward through physical back-pressure. The engine applies a single-step Graph Laplacian heat equation to smooth the friction array $f$ across topological neighbors:
@@ -762,4 +779,146 @@ For any topology changes (e.g., adding or removing nodes or edge types), the dim
 $$(L - \sigma I) \vec{v} = (\lambda - \sigma) \vec{v}$$
 
 with stability shift $\sigma = 10^{-5}$. The lowest non-trivial eigenvalue $\lambda_2$ and its associated eigenvector $\vec{v}_2$ are extracted using `scipy.sparse.linalg.eigsh` to partition the network and repulse 3D elevations. For more information, refer to [docs/extending_feeds.md](docs/extending_feeds.md).
+
+---
+
+## 11. Security, Concurrency, and Stability Architecture
+
+To ensure the high-throughput, real-time visualization is resilient against parallel request corruption, unauthorized mutations, directory traversal vulnerabilities, resource exhaustion, and information leakage, the HTTP gateway (`server.py`) enforces a multi-layered security and concurrency control framework.
+
+### A. Concurrency Control & State Locking Architecture
+The HTTP server utilizes a multi-threaded, connection-per-thread architecture based on `socketserver.ThreadingTCPServer`. Because multiple threads concurrently execute pathfinding requests, read cache values, and process administrative state mutations (such as injecting or clearing simulation states), three dedicated mutex boundaries are enforced:
+
+1.  **State Serialization Lock (`_sim_lock`)**: Protects writes to the persistent `sim_state.json` file. Any POST request targeting `/api/inject` or `/api/clear` must acquire this lock to prevent write-after-write collisions or partial file serialization corruption.
+2.  **Telemetry Cache Lock (`_cache_lock`)**: Guards the global network state cache dictionary `_cache` during graph reload operations.
+3.  **Rate Limiting Serialization Lock (`_rate_limit_lock`)**: Restricts access to the in-memory rolling request registry `_rate_limit_history` to prevent race conditions during IP-based request tracking.
+
+#### Double-Checked Locking Pattern
+To minimize thread contention overhead when loading and augmenting the heavy regional graph, the server implements the **Double-Checked Locking** pattern when loading network state from `network_state.npz` and `static/metro_tunnels.json`:
+
+$$\text{Check 1: } \text{mtime} = \max(\text{mtime}_{\text{state}}, \text{mtime}_{\text{tunnels}})$$
+$$\text{If } \text{cache.mtime} = \text{mtime}, \text{ return cached graph immediately.}$$
+$$\text{Else, acquire } \text{_cache_lock}:$$
+$$\quad \text{Check 2: } \text{Re-verify } \text{cache.mtime} = \text{mtime} \text{ under lock.}$$
+$$\quad \text{If not equal, reload and augment the graph, then update cache.}$$
+
+This ensures that the expensive augmented cost matrix calculation is executed exactly once per filesystem update, letting subsequent parallel requests read the cache without obtaining a lock.
+
+#### Atomic Cache Dictionary Reassignment
+To prevent reader threads from encountering intermediate or partially written dictionary states while the cache is being loaded under `_cache_lock`, the final update step in `_load_and_augment_graph_unlocked` does not modify the global `_cache` in-place. Instead, it constructs a complete local dictionary representation $new\_cache$ and performs an atomic pointer reassignment:
+
+$$\_cache = new\_cache$$
+
+This ensures that any reader thread accessing the global `_cache` dynamically either sees the prior fully populated cache state or the newly updated cache state, eliminating race conditions during read operations.
+
+
+### B. Path Whitelisting and Traversal Prevention
+The server implements strict path whitelisting on incoming GET requests to mitigate directory traversal exploits. All GET paths are parsed, decoded, and normalized to remove relative path segments:
+
+$$\text{Path}_{\text{normalized}} = \operatorname{posixpath.normpath}(\operatorname{urllib.parse.unquote}(\text{Path}))$$
+
+Any path that resolves outside the designated whitelist is immediately blocked:
+1.  **Direct File Whitelist**: Paths must match one of the authorized core application templates: `["/", "/index.html", "/buses.html", "/trains.html", "/favicon.ico"]`.
+2.  **Static Directory Whitelist**: Paths prefixed with `/static/` are permitted only if they map to existing files within the local `static/` directory. The server explicitly checks filesystem existence to prevent standard library handlers from leaking local directory indices:
+    $$\operatorname{exists}(\operatorname{abspath}(\operatorname{join}(\text{"static"}, \text{Path}_{\text{relative}}))) == \text{True}$$
+3.  **Favicon Fallback**: If `/favicon.ico` is requested but does not exist on disk, the server intercepts the request and responds with a static, 1x1 transparent PNG payload to prevent raising unnecessary HTTP 404 logs.
+
+### C. API Key Authorization (Bearer Token)
+Administrative mutations (`/api/inject` and `/api/clear`) are protected using HMAC-based constant-time comparison. The server extracts the authorization token from the request headers:
+
+$$\text{Token}_{\text{bearer}} = \text{Headers.get("Authorization")}$$
+
+Authorization is granted if and only if the environment variable `XRAY_API_KEY` is defined, and the incoming token matches the secret using constant-time comparison:
+
+$$\operatorname{hmac.compare\_digest}(\text{Token}_{\text{bearer}}, \text{"Bearer " } + \text{XRAY\_API\_KEY}) == \text{True}$$
+
+If `XRAY_API_KEY` is not defined in the environment, the server logs a warning to the standard error stream and rejects all administrative requests with HTTP status code `401 Unauthorized` to prevent default-access vulnerability bypasses.
+
+### D. IP-Based Rolling Rate Limiting
+To prevent resource exhaustion (Denial of Service) attacks targeting the sparse Dijkstra pathfinding engine, the `/api/route` and `/api/bridge` endpoints enforce an IP-based rolling window rate limit of **10 requests per minute** per client IP.
+
+The server records the epoch timestamp $t$ of each request in a list $T_{\text{IP}}$ mapping to the client's IP. On each incoming request, the registry is cleaned:
+
+$$T_{\text{IP}, \text{cleaned}} = \{ t_i \in T_{\text{IP}} \mid t_{\text{now}} - t_i \le 60.0 \}$$
+
+If $|T_{\text{IP}, \text{cleaned}}| \ge 10$, the request is blocked and the server responds immediately with HTTP status code `429 Too Many Requests`.
+
+#### Pruning Sweep & Memory Leak Prevention
+To prevent unbounded memory growth of the request registry $\mathcal{R}$ (where keys are client IPs and values are timestamp lists), the server executes a global pruning sweep every 100 requests. The system maintains a rolling counter $C_{\text{requests}} \leftarrow C_{\text{requests}} + 1$. 
+
+When $C_{\text{requests}} \pmod{100} = 0$, the server acquires the rate limit lock and evaluates the history for every active IP in the registry. For each IP $k$:
+
+$$T_{k, \text{pruned}} = \{ t_i \in T_k \mid t_{\text{now}} - t_i \le 60.0 \}$$
+
+$$\mathcal{R}[k] \leftarrow \begin{cases}
+T_{k, \text{pruned}} & \text{if } |T_{k, \text{pruned}}| > 0 \\
+\text{Deleted from } \mathcal{R} & \text{otherwise}
+\end{cases}$$
+
+This periodic sweeping mechanism prevents inactive IPs (with empty active histories) from lingering in memory, bounding memory consumption of the web gateway.
+
+
+### E. Exception Sanitization and Logging
+To prevent database schemas, local system paths, or detailed call stack tracebacks from leaking to the client, the server isolates all endpoint handlers inside structured `try...except` exception guards.
+
+When an unhandled exception $\mathcal{E}$ is caught:
+1.  **Detailed Diagnostic Logging**: The full stack traceback of $\mathcal{E}$ is appended to `server.log` alongside a UTC timestamp:
+    $$\text{Log} \leftarrow \text{Timestamp}_{\text{UTC}} + \operatorname{traceback.format\_exc}(\mathcal{E})$$
+2.  **Sanitized Client Response**: The client receives a generic, high-level JSON response with a custom message (e.g., `"Invalid JSON payload"` or `"Internal server error"`), hiding all stack traces and implementation details.
+
+
+## 12. Decomposed Processing Pipeline & Concurrency Controls
+
+To achieve high modularity and clean separation of concerns, the core processing loop (`main_loop`) in `engine.py` is decomposed into five single-responsibility helper functions. This architecture isolates data ingestion, matrix formulation, predictive alerting, visualization exports, and terminal dashboards.
+
+### A. Modular Processing Pipeline
+
+1. **Friction Field Construction (`compute_friction_field`)**:
+   - **Role**: Collects live sensor states (bus speeds, Metrorail surges, weather drag, and Waze/municipal incidents) and constructs the friction field vector $f \in \mathbb{R}^N$.
+   - **Mathematical Perturbation**: To break degenerate eigenvalue ties in symmetric networks, a microscopic deterministic noise wiggler is added:
+     $$f_i \leftarrow f_i + 10^{-5} \cdot \sin\left(\frac{2\pi \cdot i}{N}\right)$$
+   - **Heat Kernel Diffusion**: Simulates back-pressure congestion spillover using a discrete graph heat equation:
+     $$f_{\text{smoothed}} = (1 - \alpha) f + \alpha D_{\text{mask}}^{-1} W_{\text{mask}} f$$
+     where $\alpha = 0.20$ (`ALPHA_DIFFUSION`), $W_{\text{mask}}$ is the unweighted topological adjacency matrix, and $D_{\text{mask}}$ is the diagonal degree matrix.
+   - **Floor Clamp**: Enforces $f_i \leftarrow \max(f_i, 0.01)$ to prevent rank-deficient singularity failures in the sparse solver.
+   
+2. **Fracture Detection & Canary Locking (`detect_fractures`)**:
+   - **Role**: Evaluates edge-level connectivity degradation.
+   - **Joint Weight scaling**: Calculates joint edge weights as $W_{ij} = f_i \cdot f_j$.
+   - **Centrality-Adjusted Fracture threshold**: Flagged as a fracture if $W_{ij} < \text{Threshold}_{ij}$:
+     $$\text{Threshold}_{ij} = 0.4 \cdot (1.0 + \gamma \cdot (1.0 - \text{mean}(C_i, C_j)))$$
+     where $\gamma = 0.50$ (`GAMMA_CENTRALITY`) and $C_i = D_i / \max(D)$ is normalized degree centrality.
+   - **Limit Proofs**:
+     - *Urban Hubs*: High centrality limit $\text{mean}(C_i, C_j) \approx 1.0 \implies \text{Threshold} \approx 0.40$, filtering out background delay noise.
+     - *Isolated Corridors*: Low centrality limit $\text{mean}(C_i, C_j) \approx 0.0 \implies \text{Threshold} \approx 0.60$, increasing sensitivity to bottle-necks.
+   - **Canary Protocol**: Evaluates target canary vehicle positions from `state['live_buses']` and registers predictive entries.
+   
+3. **Canary Adjudication (`adjudicate_predictions`)**:
+   - **Role**: Cross-references predictive warnings (X-Ray) against official service bulletins (WMATA).
+   - **Scoreboard Management**: Computes dispatcher bulletin latency lead times and logs records to `prediction_scoreboard.csv`.
+   
+4. **Visualization Export (`export_visualization_data`)**:
+   - **Role**: Formulates and exports graph coordinates and multimodal metrics.
+   - **Metrics Formulated**:
+     - *Panic Shift Index (PSI)*: Captures rapid modal shifting to bikeshare docks:
+       $$\text{PSI} = \min\left( \max\left( \Delta N_{\text{depleted}} \cdot 15.0 \cdot (1.0 + A_{\text{rail}}) + N_{\text{depleted}} \cdot 0.5 \cdot (1.0 + A_{\text{rail}}), 0.0 \right), 100.0 \right)$$
+     - *Congestion Wavefront Velocity ($v_{\text{wave}}$)*: Measures wave propagation of queues:
+       $$v_{\text{wave}} = \max_{k} \left( \frac{\max_{j} \text{Haversine}(k, j)_t - \max_{j} \text{Haversine}(k, j)_{t-1}}{30.0} \right)$$
+     - *Latency Splits*: Separates physical gridlock latency $d_{\text{friction}, i} = d_i \cdot (1 - \frac{\text{speed}_i}{20.0})$ from schedule slippage $d_{\text{operational}, i} = d_i - d_{\text{friction}, i}$.
+     - *Weather Drag Coefficient ($\beta_{\text{weather}}$)*: Covariance-to-variance regression slope of vehicle speed vs. precipitation rate.
+   - **File Exports**: Safely outputs `network_state.npz` and `static/live_data.json`.
+   
+5. **Terminal Dashboard (`print_console_dashboard`)**:
+   - **Role**: Employs non-blocking ANSI escape sequences `print('\033[2J\033[H', end='')` to refresh terminal telemetry.
+
+### B. File Locking & Concurrency Control
+To prevent TOCTOU write races and concurrent file read corruption when writing `sim_state.json`, a multi-process advisory lock is enforced:
+- **Atomic File replacement**: Updates are written to a temporary file (`sim_state.json.tmp`) and then atomically renamed via `os.replace` to `sim_state.json`.
+- **Cross-Process Advisory Locking**: Access is protected using `fcntl.flock` on a persistent lock file `sim_state.lock` with a graceful POSIX-safe try/except fallback.
+
+### C. Eigensolver Fallback Robustness
+- **Dense Solver Fallback**: When Giant Connected Component size $n \le 3$, `spectral_analysis` automatically uses `scipy.linalg.eigh` fallback to avoid sparse-solver dimensional exceptions.
+- **Exception Handling**: Explicitly catches `ArpackNoConvergence`, `ArpackError`, and `ValueError` inside `spectral_analysis`, logging diagnostic details (such as converged eigenvalue counts) to `sys.stderr` and falling back to the SM solver before returning topological default values `(0.0, np.zeros(n), 0.0)`.
+
+
 

@@ -1,9 +1,36 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import numpy as np
 import plotly.graph_objects as go
 import time
 import os
 import json
+import contextlib
+import sys
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+@contextlib.contextmanager
+def file_lock(lock_file_path, exclusive=True):
+    if fcntl is None:
+        yield
+        return
+    lock_file = None
+    try:
+        lock_file = open(lock_file_path, "w")
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(lock_file, mode)
+        yield
+    finally:
+        if lock_file is not None:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_file.close()
 
 st.set_page_config(layout="wide", page_title="DMV Gridlock X-Ray 3D")
 
@@ -21,15 +48,36 @@ DC_LON, DC_LAT = -77.0369, 38.9072
 
 def inject_sim_node(node_id):
     sim_file = "sim_state.json"
-    injected = []
-    if os.path.exists(sim_file):
-        with open(sim_file, "r") as f: injected = json.load(f).get("injected_nodes", [])
-    if node_id not in injected:
-        injected.append(node_id)
-        with open(sim_file, "w") as f: json.dump({"injected_nodes": injected}, f)
+    lock_file = "sim_state.lock"
+    with file_lock(lock_file):
+        injected = []
+        if os.path.exists(sim_file):
+            try:
+                with open(sim_file, "r") as f:
+                    injected = json.load(f).get("injected_nodes", [])
+            except (OSError, json.JSONDecodeError):
+                pass
+        if node_id not in injected:
+            injected.append(node_id)
+            tmp_file = sim_file + ".tmp"
+            try:
+                with open(tmp_file, "w") as f:
+                    json.dump({"injected_nodes": injected}, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_file, sim_file)
+            except OSError:
+                pass
 
 def clear_sim():
-    if os.path.exists("sim_state.json"): os.remove("sim_state.json")
+    sim_file = "sim_state.json"
+    lock_file = "sim_state.lock"
+    with file_lock(lock_file):
+        if os.path.exists(sim_file):
+            try:
+                os.remove(sim_file)
+            except OSError:
+                pass
 
 def load_data_resilient():
     for _ in range(5):
@@ -43,6 +91,7 @@ def load_data_resilient():
     return None
 
 def main():
+    st_autorefresh(interval=15000, key="data_refresh_rate")
     st.title("🛰️ DMV Topological Terrain X-Ray")
     
     if "pulse_history" not in st.session_state:
@@ -227,10 +276,6 @@ def main():
 
     st.plotly_chart(fig, width='stretch', key="dmv_stable_xray", theme=None)
     st.caption(f"🚀 Render Density: {viz_density*100:.0f}% | Auto-Refreshing Every 15s")
-
-    # --- 4. THE LOOP TRIGGER ---
-    time.sleep(15)
-    st.rerun()
 
 if __name__ == "__main__":
     main()

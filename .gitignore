@@ -22,6 +22,7 @@ telemetry_history.csv
 sim_state.json
 rate_limit_state.json
 server.log
+*.lock
 
 # Live visualization outputs
 static/live_data.json

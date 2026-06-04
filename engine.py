@@ -8,59 +8,45 @@ import requests
 import pandas as pd
 import numpy as np
 import scipy.sparse as sp
-from scipy.sparse.linalg import eigsh
+from scipy.sparse.linalg import eigsh, ArpackNoConvergence, ArpackError
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import KDTree
-import networkx as nx
 from google.transit import gtfs_realtime_pb2
+import google.protobuf.message
 import json
 import csv
 import math
+import datetime
+import heapq
+import traceback
+import sys
+import contextlib
 
-POTOMAC_BARRIER = [
-    ((38.995, -77.162), (38.960, -77.130)),
-    ((38.960, -77.130), (38.930, -77.115)),
-    ((38.930, -77.115), (38.900, -77.070)),
-    ((38.900, -77.070), (38.888, -77.060)),
-    ((38.888, -77.060), (38.875, -77.043)),
-    ((38.875, -77.043), (38.850, -77.040)),
-    ((38.850, -77.040), (38.790, -77.035))
-]
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
-ANACOSTIA_BARRIER = [
-    ((38.935, -76.940), (38.915, -76.955)),
-    ((38.915, -76.955), (38.900, -76.965)),
-    ((38.900, -76.965), (38.875, -76.980)),
-    ((38.875, -76.980), (38.860, -77.010)),
-    ((38.860, -77.010), (38.858, -77.025))
-]
+from utils import POTOMAC_BARRIER, ANACOSTIA_BARRIER, ccw, segments_intersect, crosses_river, smooth_floor
 
-def ccw(A, B, C):
-    return (C[0] - A[0]) * (B[1] - A[1]) > (B[0] - A[0]) * (C[1] - A[1])
-
-def segments_intersect(A, B, C, D):
-    return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
-
-def crosses_river(lat1, lon1, lat2, lon2):
-    p1 = (lat1, lon1)
-    p2 = (lat2, lon2)
-    for seg in POTOMAC_BARRIER:
-        if segments_intersect(p1, p2, seg[0], seg[1]):
-            return True
-    for seg in ANACOSTIA_BARRIER:
-        if segments_intersect(p1, p2, seg[0], seg[1]):
-            return True
-    return False
-
-def smooth_floor(x, k=100.0):
-    if isinstance(x, np.ndarray):
-        kx = k * x
-        return np.where(kx > 50.0, x, np.log1p(np.exp(np.clip(kx, -50.0, 50.0))) / k)
-    else:
-        kx = k * x
-        if kx > 50.0:
-            return x
-        return math.log1p(math.exp(kx)) / k
+@contextlib.contextmanager
+def file_lock(lock_file_path, exclusive=True):
+    if fcntl is None:
+        yield
+        return
+    lock_file = None
+    try:
+        lock_file = open(lock_file_path, "w")
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(lock_file, mode)
+        yield
+    finally:
+        if lock_file is not None:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_file.close()
 
 # --- CONFIGURATION ---
 API_KEY = os.environ.get("WMATA_API_KEY", "YOUR_API_KEY_HERE")
@@ -123,8 +109,8 @@ class RateLimiter:
                             for t in timestamps:
                                 try:
                                     valid_ts.append(float(t))
-                                except (ValueError, TypeError):
-                                    pass
+                                except (ValueError, TypeError) as e:
+                                    print(f"⚠️ Warning: conversion error in load_state: {e}", file=sys.stderr)
                             if valid_ts:
                                 if sanitized_url not in self.link_history:
                                     self.link_history[sanitized_url] = []
@@ -136,10 +122,10 @@ class RateLimiter:
                     for t in raw_overall_history:
                         try:
                             self.overall_history.append(float(t))
-                        except (ValueError, TypeError):
-                            pass
-            except Exception as e:
-                print(f"⚠️ Warning: Failed to load rate limit state file: {e}")
+                        except (ValueError, TypeError) as e:
+                            print(f"⚠️ Warning: conversion error in load_state: {e}", file=sys.stderr)
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"⚠️ Warning: Failed to load rate limit state file: {e}", file=sys.stderr)
                 self.link_history = {}
                 self.overall_history = []
 
@@ -155,8 +141,8 @@ class RateLimiter:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_file, self.state_file)
-        except Exception as e:
-            print(f"⚠️ Warning: Failed to save rate limit state atomically: {e}")
+        except OSError as e:
+            print(f"⚠️ Warning: Failed to save rate limit state atomically: {e}", file=sys.stderr)
 
     def clean_history(self, now):
         cutoff = now - 60.0
@@ -250,7 +236,8 @@ def log_telemetry(ts, l2, gap, friction, dc, md, va, bike, lat):
     try:
         with open(LOG_FILE, 'a', newline='') as f:
             csv.writer(f).writerow([ts, l2, gap, friction, dc, md, va, bike, lat])
-    except: pass
+    except OSError as e:
+        print(f"⚠️ Warning: Failed to write to telemetry log: {e}", file=sys.stderr)
 
 def download_gtfs_static():
     print(f"Downloading GTFS Static from {STATIC_GTFS_URL}...")
@@ -260,7 +247,9 @@ def download_gtfs_static():
         response.raise_for_status()
         if not os.path.exists(GTFS_DIR): os.makedirs(GTFS_DIR)
         with zipfile.ZipFile(io.BytesIO(response.content)) as z: z.extractall(GTFS_DIR)
-    except Exception as e: print(f"❌ Failed: {e}"); raise
+    except (requests.RequestException, zipfile.BadZipFile, OSError) as e:
+        print(f"❌ Failed: {e}", file=sys.stderr)
+        raise
 
 def download_rideon_gtfs_static():
     rideon_dir = os.path.join(GTFS_DIR, "rideon")
@@ -281,10 +270,10 @@ def download_rideon_gtfs_static():
         print("RideOn static GTFS downloaded and extracted successfully.")
         return True
     except (requests.exceptions.RequestException, zipfile.BadZipFile) as e:
-        print(f"⚠️ Failed to download/extract RideOn GTFS: {e}")
+        print(f"⚠️ Failed to download/extract RideOn GTFS: {e}", file=sys.stderr)
         return False
-    except Exception as e:
-        print(f"⚠️ Unexpected error downloading RideOn GTFS: {e}")
+    except OSError as e:
+        print(f"⚠️ Unexpected error downloading RideOn GTFS: {e}", file=sys.stderr)
         return False
 
 def load_static_topology():
@@ -477,8 +466,8 @@ def load_static_topology():
                     if len(coords) > 0 and (len(coords) - 1) % 4 != 0:
                         downsampled.append(coords[-1])
                     shapes_map['wmata_' + str(sh_id)] = downsampled
-            except Exception as e:
-                print(f"Error parsing WMATA shapes.txt: {e}")
+            except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError, ValueError) as e:
+                print(f"Error parsing WMATA shapes.txt: {e}", file=sys.stderr)
                 
         # Load RideOn shapes
         rideon_shapes_path = os.path.join(GTFS_DIR, "rideon", "shapes.txt")
@@ -492,8 +481,8 @@ def load_static_topology():
                     if len(coords) > 0 and (len(coords) - 1) % 4 != 0:
                         downsampled.append(coords[-1])
                     shapes_map['rideon_' + str(sh_id)] = downsampled
-            except Exception as e:
-                print(f"Error parsing RideOn shapes.txt: {e}")
+            except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError, KeyError, ValueError) as e:
+                print(f"Error parsing RideOn shapes.txt: {e}", file=sys.stderr)
                 
         with open(shapes_json_path, "w") as f_sh_json:
             json.dump(shapes_map, f_sh_json)
@@ -516,7 +505,6 @@ async def poll_weather_once(session):
             precip = 0.0
             hourly_data = data.get('hourly', {})
             if 'precipitation' in hourly_data:
-                import datetime
                 now_hour_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:00")
                 if now_hour_str in hourly_data.get('time', []):
                     idx = hourly_data['time'].index(now_hour_str)
@@ -524,8 +512,8 @@ async def poll_weather_once(session):
                 else:
                     precip = float(hourly_data['precipitation'][0]) if hourly_data['precipitation'] else 0.0
             state['precipitation_rate'] = precip
-    except Exception as e:
-        print(f"Error in poll_weather_once: {e}")
+    except (aiohttp.ClientError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"Error in poll_weather_once: {e}", file=sys.stderr)
 
 async def fetch_incident_layer(session, url, tree, region_key):
     if not url:
@@ -545,7 +533,8 @@ async def fetch_incident_layer(session, url, tree, region_key):
                     dist, idx = tree.query([coords[1], coords[0]])
                     if dist < 0.008: snapped.append(int(idx))
                 state['incidents'][region_key] = snapped
-    except: pass
+    except (aiohttp.ClientError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"⚠️ Warning: Failed to fetch incidents from {url}: {e}", file=sys.stderr)
 
 async def poll_incidents_once(session, tree):
     await asyncio.gather(
@@ -561,8 +550,8 @@ async def poll_bikeshare_once(session, tree):
             stations = info_data['data']['stations']
             id_to_node = {s['station_id']: int(tree.query([s['lat'], s['lon']])[1]) for s in stations if tree.query([s['lat'], s['lon']])[0] < 0.0015}
             station_metadata = {s['station_id']: {"name": s['name'], "capacity": s['capacity']} for s in stations}
-    except Exception as e:
-        print(f"Error in poll_bikeshare_once (info): {e}")
+    except (aiohttp.ClientError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"Error in poll_bikeshare_once (info): {e}", file=sys.stderr)
         return
 
     try:
@@ -592,8 +581,8 @@ async def poll_bikeshare_once(session, tree):
                 "depleted_node_indices": depl_idx,
                 "node_to_metadata": node_to_metadata
             })
-    except Exception as e:
-        print(f"Error in poll_bikeshare_once (status): {e}")
+    except (aiohttp.ClientError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"Error in poll_bikeshare_once (status): {e}", file=sys.stderr)
 
 async def poll_gtfs_rt_once(session):
     try:
@@ -623,8 +612,8 @@ async def poll_gtfs_rt_once(session):
                 state['gtfs_delays'].update(delays)
                 state['trip_delays'].update(trip_delays)
                 state['last_payload_ts'] = time.time()
-    except Exception as e:
-        print(f"Error in poll_gtfs_rt_once: {e}")
+    except (aiohttp.ClientError, google.protobuf.message.DecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"Error in poll_gtfs_rt_once: {e}", file=sys.stderr)
 
 async def poll_rideon_vp_once(session, tree, nodes_list):
     api_key = os.environ.get("RIDEON_API_KEY", "")
@@ -729,8 +718,8 @@ async def poll_rideon_vp_once(session, tree, nodes_list):
                     state['live_buses'].update(current_buses)
                     
                     state['last_payload_ts'] = time.time()
-    except Exception as e:
-        print(f"Error in poll_rideon_vp_once: {e}")
+    except (aiohttp.ClientError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"Error in poll_rideon_vp_once: {e}", file=sys.stderr)
 
 async def poll_rideon_tu_once(session):
     api_key = os.environ.get("RIDEON_API_KEY", "")
@@ -763,8 +752,8 @@ async def poll_rideon_tu_once(session):
                         if k.startswith('rideon_'): del state['trip_delays'][k]
                     state['gtfs_delays'].update(new_delays)
                     state['trip_delays'].update(new_trip_delays)
-    except Exception as e:
-        print(f"Error in poll_rideon_tu_once: {e}")
+    except (aiohttp.ClientError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"Error in poll_rideon_tu_once: {e}", file=sys.stderr)
 
 async def poll_alerts_once(session):
     try:
@@ -783,8 +772,8 @@ async def poll_alerts_once(session):
                                 alerted_routes.add('wmata_' + str(informed.route_id))
                 state['wmata_official_alerts'] = alerted_routes
                 state['graph_stats']['active_alerts'] = active_alerts
-    except Exception as e:
-        print(f"Error in poll_alerts_once: {e}")
+    except (aiohttp.ClientError, google.protobuf.message.DecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"Error in poll_alerts_once: {e}", file=sys.stderr)
 
 async def poll_vehicle_positions_once(session):
     try:
@@ -873,8 +862,8 @@ async def poll_vehicle_positions_once(session):
                 state['live_buses'].update(current_buses)
                 
                 state['last_payload_ts'] = time.time()
-    except Exception as e:
-        print(f"Error in poll_vehicle_positions_once: {e}")
+    except (aiohttp.ClientError, google.protobuf.message.DecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"Error in poll_vehicle_positions_once: {e}", file=sys.stderr)
 
 async def poll_metrorail_rt_once(session):
     try:
@@ -887,8 +876,8 @@ async def poll_metrorail_rt_once(session):
                 for entity in feed.entity:
                     if entity.HasField('alert'): alerts += 1
                 state['rail_alerts'] = alerts
-    except Exception as e:
-        print(f"Error in poll_metrorail_rt_once: {e}")
+    except (aiohttp.ClientError, google.protobuf.message.DecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"Error in poll_metrorail_rt_once: {e}", file=sys.stderr)
 
 def haversine(lat1, lon1, lat2, lon2):
     R = 3958.8 # Earth radius in miles
@@ -904,8 +893,8 @@ try:
     if os.path.exists("static/metro_stations.json"):
         with open("static/metro_stations.json", "r") as f:
             metro_stations = json.load(f)
-except Exception as e:
-    print(f"Error loading metro_stations.json: {e}")
+except (OSError, json.JSONDecodeError) as e:
+    print(f"Error loading metro_stations.json: {e}", file=sys.stderr)
 
 async def poll_rail_positions_once(session, tree, stops_info, nodes_list):
     try:
@@ -992,8 +981,8 @@ async def poll_rail_positions_once(session, tree, stops_info, nodes_list):
                                     
                 state['rail_surges'] = surges
                 state['train_positions'] = train_positions
-    except Exception as e:
-        print(f"Error in poll_rail_positions_once: {e}")
+    except (aiohttp.ClientError, google.protobuf.message.DecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"Error in poll_rail_positions_once: {e}", file=sys.stderr)
 
 class PollingTask:
     def __init__(self, task_id, interval, priority):
@@ -1006,8 +995,6 @@ class PollingTask:
         if self.next_run == other.next_run:
             return self.priority < other.priority
         return self.next_run < other.next_run
-
-import heapq
 
 async def priority_queue_scheduler(tasks, state, rate_limiter, tree, nodes_list, stops_info, route_to_stops):
     queue = []
@@ -1074,14 +1061,12 @@ async def priority_queue_scheduler(tasks, state, rate_limiter, tree, nodes_list,
                     await poll_metrorail_rt_once(session)
                 elif task.task_id == 'rail_positions':
                     await poll_rail_positions_once(session, tree, stops_info, nodes_list)
-            except Exception as task_err:
-                print(f"Error executing task {task.task_id}: {task_err}")
+            except (aiohttp.ClientError, OSError, KeyError, ValueError, TypeError, AttributeError, IndexError, google.protobuf.message.DecodeError) as task_err:
+                print(f"Error executing task {task.task_id}: {task_err}", file=sys.stderr)
                 
             task.next_run = now + task.interval
             heapq.heappush(queue, task)
             await asyncio.sleep(0.01)
-
-
 
 def spectral_analysis(W, f=None, v0=None):
     n = W.shape[0]
@@ -1099,17 +1084,598 @@ def spectral_analysis(W, f=None, v0=None):
     if v0 is not None and len(v0) == n:
         v0_param = v0
         
+    if n <= 3:
+        try:
+            import scipy.linalg
+            evals, evecs = scipy.linalg.eigh(L.toarray())
+            idx = np.argsort(evals)
+            if n == 3:
+                return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
+            elif n == 2:
+                return evals[idx[1]], evecs[:, idx[1]], evals[idx[1]] - evals[idx[0]]
+            else:
+                return 0.0, np.zeros(n), 0.0
+        except Exception as e:
+            print(f"❌ [Solver Error] Dense eigh fallback failed for n={n}: {e}", file=sys.stderr)
+            return 0.0, np.zeros(n), 0.0
+
     try:
         evals, evecs = eigsh(L, k=3, which='LM', sigma=sigma_t, tol=1e-2, maxiter=500, v0=v0_param)
         idx = np.argsort(evals)
         return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
-    except:
+    except ArpackNoConvergence as e:
+        converged_count = len(e.eigenvalues) if hasattr(e, 'eigenvalues') and e.eigenvalues is not None else 0
+        print(f"⚠️ [Solver Warning] Primary shift-invert eigsh (LM, sigma={sigma_t:.6f}) failed to converge. "
+              f"Converged eigenvalues: {converged_count}/3. Attempting fallback (SM)...", file=sys.stderr)
         try:
             evals, evecs = eigsh(L, k=3, which='SM', tol=1e-1, v0=v0_param)
             idx = np.argsort(evals)
             return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
-        except:
+        except ArpackNoConvergence as e_fb:
+            fb_converged = len(e_fb.eigenvalues) if hasattr(e_fb, 'eigenvalues') and e_fb.eigenvalues is not None else 0
+            print(f"❌ [Solver Error] Fallback eigsh (SM) also failed to converge. "
+                  f"Converged eigenvalues: {fb_converged}/3. Returning topological fallbacks.", file=sys.stderr)
             return 0.0, np.zeros(n), 0.0
+        except ArpackError as e_fb_ap:
+            print(f"❌ [Solver Error] Fallback eigsh (SM) ARPACK error: {e_fb_ap}. Returning topological fallbacks.", file=sys.stderr)
+            return 0.0, np.zeros(n), 0.0
+        except ValueError as e_fb_val:
+            print(f"❌ [Solver Error] Fallback eigsh (SM) ValueError: {e_fb_val}. Returning topological fallbacks.", file=sys.stderr)
+            return 0.0, np.zeros(n), 0.0
+    except ArpackError as e:
+        print(f"❌ [Solver Error] Primary eigsh (LM) ARPACK error: {e}. Attempting fallback (SM)...", file=sys.stderr)
+        try:
+            evals, evecs = eigsh(L, k=3, which='SM', tol=1e-1, v0=v0_param)
+            idx = np.argsort(evals)
+            return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
+        except ArpackNoConvergence as e_fb:
+            fb_converged = len(e_fb.eigenvalues) if hasattr(e_fb, 'eigenvalues') and e_fb.eigenvalues is not None else 0
+            print(f"❌ [Solver Error] Fallback eigsh (SM) also failed to converge under primary ARPACK error. "
+                  f"Converged eigenvalues: {fb_converged}/3. Returning topological fallbacks.", file=sys.stderr)
+            return 0.0, np.zeros(n), 0.0
+        except Exception as e_fb_all:
+            print(f"❌ [Solver Error] Fallback eigsh (SM) failed under primary ARPACK error: {e_fb_all}. Returning topological fallbacks.", file=sys.stderr)
+            return 0.0, np.zeros(n), 0.0
+    except ValueError as e:
+        print(f"❌ [Solver Error] Primary eigsh (LM) invalid parameters: {e}. Returning topological fallbacks.", file=sys.stderr)
+        return 0.0, np.zeros(n), 0.0
+    except Exception as e:
+        print(f"❌ [Solver Error] General failure in spectral_analysis: {e}. Returning topological fallbacks.", file=sys.stderr)
+        return 0.0, np.zeros(n), 0.0
+
+def compute_friction_field(
+    state,
+    W_mask,
+    nodes_list,
+    node_to_idx,
+    stops_info,
+    surge_hubs_idx,
+    D_inv,
+    last_f,
+    last_l2,
+    last_v2,
+    last_gap,
+    loop_start
+):
+    f = np.ones(len(nodes_list), dtype=np.float32) * state['weather_penalty']
+    
+    # Mathematical Tau Wiggle: Break degenerate eigenvalue symmetry ties.
+    f += 1e-5 * np.sin(math.tau * np.arange(len(nodes_list)) / len(nodes_list))
+    
+    # Apply Metrorail Surface Surge
+    if state['rail_alerts'] > 0:
+        for idx in surge_hubs_idx: f[idx] *= 0.7
+        
+    # Precision Ground Zero Surges
+    for idx in state['rail_surges']:
+        f[idx] *= 0.6
+        
+    # Physical live speeds from VehiclePositions
+    for s_id, speeds in state.get('live_speeds_list', {}).items():
+        if s_id in node_to_idx:
+            idx = node_to_idx[s_id]
+            n_severe = sum(1 for speed in speeds if speed < 5.0)
+            m_heavy = sum(1 for speed in speeds if 5.0 <= speed < 15.0)
+            if n_severe > 0 or m_heavy > 0:
+                penalty = (0.3 ** min(n_severe, 3)) * (0.6 ** min(m_heavy, 3))
+                f[idx] *= penalty
+                f[idx] = max(f[idx], 0.01)
+                
+    if os.path.exists("sim_state.json"):
+        try:
+            with file_lock("sim_state.lock", exclusive=False):
+                with open("sim_state.json", "r") as f_sim:
+                    state['injections'] = json.load(f_sim).get("injected_nodes", [])
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"⚠️ Warning: Failed to read or parse sim_state.json: {e}", file=sys.stderr)
+            
+    for region in state['incidents'].values():
+        for idx in region: f[idx] = 0.05
+    for s_id in state['injections']:
+        if s_id in node_to_idx: f[node_to_idx[s_id]] = 0.01
+    
+    # Apply Spatial Friction Diffusion (Graph Heat Kernel)
+    D_inv_W_f = D_inv * (W_mask @ f)
+    f = (1.0 - ALPHA_DIFFUSION) * f + ALPHA_DIFFUSION * D_inv_W_f
+    f = np.clip(smooth_floor(f), 0.01, 1.0)
+    
+    W_weighted = sp.diags(f) @ W_mask @ sp.diags(f)
+    
+    if last_f is not None:
+        f_diff_l2 = float(np.linalg.norm(f - last_f))
+    else:
+        f_diff_l2 = 1.0
+        
+    if last_f is not None and f_diff_l2 < 1e-3:
+        l2 = last_l2
+        v2 = last_v2
+        gap = last_gap
+    else:
+        try:
+            l2, v2, gap = spectral_analysis(W_weighted, f, last_v2)
+            if l2 == 0 and np.all(v2 == 0):
+                l2 = last_l2 if last_l2 is not None else 0.05
+                v2 = last_v2 if last_v2 is not None else np.zeros(len(nodes_list))
+                gap = last_gap if last_gap is not None else 0.05
+                print("⚠️ [Solver Warning] Spectral convergence failed. Using topological fallback values.", file=sys.stderr)
+        except (ArpackNoConvergence, ArpackError, ValueError) as solver_err:
+            l2 = last_l2 if last_l2 is not None else 0.05
+            v2 = last_v2 if last_v2 is not None else np.zeros(len(nodes_list))
+            gap = last_gap if last_gap is not None else 0.05
+            print(f"⚠️ [Solver Exception] Mathematical error: {solver_err}. Using topological fallback values.", file=sys.stderr)
+            
+    lat = (time.time() - loop_start) * 1000
+    
+    # Safe v2 formatting for graph_stats
+    v2_for_stats = v2 if v2 is not None else np.zeros(len(nodes_list))
+    worst_idx = np.argmin(f)
+    state["graph_stats"].update({
+        "compute_latency": lat, 
+        "peak_latency": max(state["graph_stats"]["peak_latency"], lat), 
+        "avg_friction": np.mean(f), 
+        "system_tension": np.std(f), 
+        "spectral_gap": gap, 
+        "total_delay_sec": 0, 
+        "fiedler_max": v2_for_stats[np.argmax(np.abs(v2_for_stats))] if len(v2_for_stats) > 0 else 0.0, 
+        "fiedler_pole_name": stops_info[nodes_list[np.argmax(np.abs(v2_for_stats))]]['name'] if len(v2_for_stats) > 0 else "Core", 
+        "worst_node_name": stops_info[nodes_list[worst_idx]]['name'] if worst_idx < len(nodes_list) else "None"
+    })
+    
+    return f, W_weighted, l2, v2, gap, lat
+
+def detect_fractures(
+    state,
+    W,
+    thresholds,
+    rows,
+    nodes_list,
+    stops_info,
+    route_to_stops
+):
+    fractures = []
+    stressed_idx = np.where(W.data < thresholds)[0]
+    
+    if len(stressed_idx) > 0:
+        sorted_stress = stressed_idx[np.argsort(W.data[stressed_idx])]
+        seen_edges = set()
+        
+        for idx in sorted_stress:
+            weight = W.data[idx]
+            r = rows[idx]
+            c = W.indices[idx]
+            
+            edge_key = tuple(sorted([r, c]))
+            if edge_key in seen_edges: continue
+            seen_edges.add(edge_key)
+            
+            u_id, v_id = nodes_list[r], nodes_list[c]
+            u_name, v_name = stops_info[u_id]['name'], stops_info[v_id]['name']
+            
+            cause = "Cascading Bus Delays"
+            delay_sec = max(state['gtfs_delays'].get(u_id, 0), state['gtfs_delays'].get(v_id, 0))
+            
+            if u_id in state['injections'] or v_id in state['injections']: cause = "🛑 SIMULATED INJECTION"
+            elif r in state['incidents']['dc'] or c in state['incidents']['dc'] or r in state['incidents']['md'] or c in state['incidents']['md'] or r in state['incidents']['va'] or c in state['incidents']['va']: cause = "🚓 MUNICIPAL INCIDENT (Crash/Closure)"
+            else:
+                is_alerted = False
+                for r_id in state['wmata_official_alerts']:
+                    if r_id in route_to_stops and (u_id in route_to_stops[r_id] or v_id in route_to_stops[r_id]):
+                        is_alerted = True; break
+                if is_alerted: cause = "⚠️ WMATA SERVICE ALERT"
+                elif state['live_speeds'].get(u_id, 20) < 5 or state['live_speeds'].get(v_id, 20) < 5:
+                    cause = "🚗 LOW VELOCITY SENSOR (< 5mph)"
+                elif delay_sec > 0: cause = f"🚌 SEVERE DELAY ({delay_sec}s reported)"
+            
+            fractures.append({"u": u_name, "v": v_name, "w": weight, "cause": cause, "u_id": u_id})
+            
+            # --- CANARY LOCK-ON ---
+            for r_id, stops in route_to_stops.items():
+                if u_id in stops and r_id not in state['active_predictions'] and len(state['canary_buses']) < 5:
+                    available_buses = state.get('live_buses', {}).get(r_id, [])
+                    if available_buses:
+                        canary_vid = available_buses[0]
+                        state['canary_buses'][canary_vid] = {"route_id": r_id, "target": u_name, "status": "Acquiring Target..."}
+                        initial_t_wmata = time.time() - 1 if r_id in state['wmata_official_alerts'] else None
+                        state['active_predictions'][r_id] = {"t_engine": time.time(), "t_physical": None, "t_wmata": initial_t_wmata, "cause": cause, "resolved": False, "pre_existing": r_id in state['wmata_official_alerts']}
+            
+            if len(fractures) >= 15: break
+            
+    return fractures
+
+def adjudicate_predictions(state, current_time):
+    for r_id, pred in list(state['active_predictions'].items()):
+        if not pred['resolved']:
+            if r_id in state['wmata_official_alerts'] and pred['t_wmata'] is None:
+                pred['t_wmata'] = current_time
+            
+            if pred['t_physical'] is not None and pred['t_wmata'] is not None:
+                lead_time = pred['t_wmata'] - pred['t_engine']
+                
+                if pred.get('pre_existing', False):
+                    winner = "WMATA"
+                    lead_time = 0
+                else:
+                    if lead_time > 60: winner = "X-RAY"
+                    elif lead_time > -60: winner = "TIE"
+                    else: winner = "WMATA"
+                
+                if winner == "X-RAY": state['scoreboard_stats']['xray_wins'] += 1
+                elif winner == "WMATA": state['scoreboard_stats']['wmata_wins'] += 1
+                
+                if not pred.get('pre_existing', False):
+                    state['scoreboard_stats']['total_races'] += 1
+                    state['scoreboard_stats']['avg_lead_time_sec'] = ((state['scoreboard_stats']['avg_lead_time_sec'] * (state['scoreboard_stats']['total_races'] - 1)) + lead_time) / state['scoreboard_stats']['total_races']
+                
+                try:
+                    with open(SCOREBOARD_FILE, 'a', newline='') as f_score:
+                        csv.writer(f_score).writerow([time.strftime('%Y-%m-%d %H:%M:%S'), r_id, pred['cause'], pred['t_engine'], pred['t_physical'], pred['t_wmata'], lead_time, winner])
+                except OSError as e:
+                    print(f"⚠️ Warning: Failed to write prediction details to scoreboard: {e}", file=sys.stderr)
+                
+                pred['resolved'] = True
+                
+            elif (current_time - pred['t_engine']) > 900 and pred['t_wmata'] is None:
+                final_cause = "UNREPORTED MICRO-JAM" if pred['t_physical'] else "GHOST FRACTURE (HEALED)"
+                
+                if pred['t_physical']:
+                    state['scoreboard_stats']['xray_wins'] += 1
+                    lead_time = 900 
+                    state['scoreboard_stats']['total_races'] += 1
+                    state['scoreboard_stats']['avg_lead_time_sec'] = ((state['scoreboard_stats']['avg_lead_time_sec'] * (state['scoreboard_stats']['total_races'] - 1)) + lead_time) / state['scoreboard_stats']['total_races']
+                else:
+                    lead_time = 0
+                    
+                try:
+                    with open(SCOREBOARD_FILE, 'a', newline='') as f_score:
+                        csv.writer(f_score).writerow([time.strftime('%Y-%m-%d %H:%M:%S'), r_id, final_cause, pred['t_engine'], pred['t_physical'], "NEVER", lead_time, "X-RAY (UNREPORTED)"])
+                except OSError as e:
+                    print(f"⚠️ Warning: Failed to write micro-jam prediction details to scoreboard: {e}", file=sys.stderr)
+                
+                pred['resolved'] = True
+            
+            if pred['resolved']:
+                keys_to_delete = [vid for vid, info in state['canary_buses'].items() if info['route_id'] == r_id]
+                for k in keys_to_delete: del state['canary_buses'][k]
+                del state['active_predictions'][r_id]
+
+def print_console_dashboard(
+    state,
+    l2,
+    gap,
+    f,
+    fractures,
+    lat,
+    uptime,
+    freshness
+):
+    print('\033[2J\033[H', end='')
+    print(f"🛰️  DMV GRIDLOCK X-RAY | {time.strftime('%X')} | CYCLE: {state['total_cycles']}\n{'='*80}\n🌍 TOPOLOGY: {state['graph_stats']['active_nodes']} Nodes | {state['graph_stats']['active_edges']} Edges\n🌤️  WEATHER:  {state['weather_desc']} ({state['weather_penalty']:.2f})\n📍 INCIDENTS: DC:{len(state['incidents']['dc'])} | MD:{len(state['incidents']['md'])} | VA:{len(state['incidents']['va'])}\n🚲 BIKESHARE: {state['bikeshare']['total_bikes']} Bikes | {state['bikeshare']['depleted_stations']} Empty Stations\n📢 ALERTS:    {state['graph_stats']['active_alerts']} Bus | {state['rail_alerts']} Metrorail\n{'-'*80}\n📊 SYSTEM PULSE:\n   Connectivity (λ2): {l2:.8f} [{'🟢 Stable' if l2 > 0.0001 else '🔴 Critical'}]\n   Spectral Gap:     {gap:.8f}\n   Avg Node Flow:    {state['graph_stats']['avg_friction']:.4f}\n   System Tension:   {state['graph_stats']['system_tension']:.4f}\n{'-'*80}")
+    
+    print("🏆 PREDICTION SCOREBOARD:")
+    avg_lead_mins = state['scoreboard_stats']['avg_lead_time_sec'] / 60
+    print(f"   X-Ray Wins: {state['scoreboard_stats']['xray_wins']} | WMATA Wins: {state['scoreboard_stats']['wmata_wins']} | Avg Lead Time: +{avg_lead_mins:.1f}m")
+    
+    print("\n🚌 CANARY TRACKER (Live GPS Target Lock):")
+    if not state['canary_buses']: print("   [Standby] No active predictions. Scanning...")
+    for vid, info in state['canary_buses'].items():
+        print(f"   [LOCKED] Route {info['route_id']} approaching {info['target'][:15]}... | {info['status']}")
+
+    print(f"\n🚨 ACTIVE FRACTURES (Top 15):")
+    if not fractures: print("   ✅ Grid is flowing nominally.")
+    else:
+        for i, frac in enumerate(fractures, 1):
+            print(f"   {i}. {frac['u']} ➔ {frac['v']}\n      └─ Friction: {frac['w']:.4f} | Cause: {frac['cause']}")
+            
+    print(f"{'-'*80}\n⚡ COMPUTE: {lat:.2f}ms | Uptime: {int(uptime//3600)}h {int((uptime%3600)//60)}m | Data: {int(freshness)}s\n{'='*80}")
+
+def export_visualization_data(
+    state,
+    v2,
+    l2,
+    gap,
+    f,
+    W,
+    nodes_list,
+    stops_info,
+    route_to_stops,
+    node_to_idx,
+    thresholds,
+    rows,
+    W_mask,
+    surge_hubs_idx=None
+):
+    try:
+        target_path = "network_state.npz"; tmp_path = "network_state_tmp"; coords = np.array([[stops_info[nid]['lat'], stops_info[nid]['lon']] for nid in nodes_list])
+        
+        # Dynamic Spectral Bisection partitioning based on Fiedler median split
+        partitions = np.where(v2 >= np.median(v2), 0, 1)
+        
+        np.savez_compressed(tmp_path, nodes=np.array(nodes_list), names=np.array([stops_info[nid]['name'] for nid in nodes_list]), v_2=v2, coords=coords, weights=W.data, indices=W.indices, indptr=W.indptr, node_friction=f, lambda_2=np.array([l2]), spectral_gap=np.array([gap]), weather_penalty=np.array([state['weather_penalty']]), weather_desc=np.array([state['weather_desc']]), incidents_dc=np.array([len(state['incidents']['dc'])]), incidents_md=np.array([len(state['incidents']['md'])]), incidents_va=np.array([len(state['incidents']['va'])]), bikeshare_depleted=np.array([state['bikeshare']['depleted_stations']]), depleted_indices=np.array(state['bikeshare']['depleted_node_indices']), centrality=np.array(state["graph_stats"]["centrality"]), active_alerts=np.array([state['graph_stats'].get('active_alerts', 0)]), partitions=partitions)
+        if os.path.exists(tmp_path + ".npz"): os.replace(tmp_path + ".npz", target_path)
+        
+        # Export JSON for the isolated WebGL iframe
+        z_vals = v2 * 150
+        gx = coords[:, 1].tolist(); gy = coords[:, 0].tolist(); gz = [0] * len(nodes_list)
+
+        # Extract boundary crossing edges (choke-points) crossing partitions
+        diff_partition = partitions[rows] != partitions[W_mask.indices]
+        boundary_mask = diff_partition & (rows < W_mask.indices)
+        bx_bound, by_bound, bz_bound = [], [], []
+        for b_idx in np.where(boundary_mask)[0]:
+            r_n = rows[b_idx]
+            c_n = W_mask.indices[b_idx]
+            bx_bound.extend([float(coords[r_n, 1]), float(coords[c_n, 1]), None])
+            by_bound.extend([float(coords[r_n, 0]), float(coords[c_n, 0]), None])
+            bz_bound.extend([float(z_vals[r_n]), float(z_vals[c_n]), None])
+
+        # Neural Web (Split into two traces with Bezier Arcs for Express Routes)
+        wx1, wy1, wz1 = [], [], []
+        wx2, wy2, wz2 = [], [], []
+        midpoint = len(W.indptr) // 2
+        
+        def get_arc(x0, y0, z0, x2, y2, z2):
+            dist = math.hypot(x2 - x0, y2 - y0)
+            if dist < 0.04: # Less than ~4km, keep it a straight line (2 points)
+                return [x0, x2], [y0, y2], [z0, z2]
+            # Long express route -> 5-point Bezier Arc
+            x1 = (x0 + x2) / 2; y1 = (y0 + y2) / 2; z1 = max(z0, z2) + (dist * 250)
+            xs, ys, zs = [], [], []
+            for t in [0, 0.25, 0.5, 0.75, 1.0]:
+                xs.append((1-t)**2 * x0 + 2*(1-t)*t * x1 + t**2 * x2)
+                ys.append((1-t)**2 * y0 + 2*(1-t)*t * y1 + t**2 * y2)
+                zs.append((1-t)**2 * z0 + 2*(1-t)*t * z1 + t**2 * z2)
+            return xs, ys, zs
+
+        for i in range(0, len(W.indptr)-1, 1):
+            for j in range(W.indptr[i], W.indptr[i+1]):
+                target = W.indices[j]
+                if i < target: # Deduplicate symmetric edges
+                    ax, ay, az = get_arc(float(coords[i, 1]), float(coords[i, 0]), float(z_vals[i]), float(coords[target, 1]), float(coords[target, 0]), float(z_vals[target]))
+                    if i < midpoint:
+                        wx1.extend(ax + [None]); wy1.extend(ay + [None]); wz1.extend(az + [None])
+                    else:
+                        wx2.extend(ax + [None]); wy2.extend(ay + [None]); wz2.extend(az + [None])
+
+        # Fractures
+        stressed_idx = np.where(W.data < thresholds)[0]
+        fx, fy, fz = [], [], []
+        for idx in stressed_idx:
+            r = rows[idx]; c = W.indices[idx]
+            if r < c: # Deduplicate symmetric fractures
+                fx.extend([float(coords[r, 1]), float(coords[c, 1]), None])
+                fy.extend([float(coords[r, 0]), float(coords[c, 0]), None])
+                fz.extend([float(z_vals[r]), float(z_vals[c]), None])
+
+        # Hubs
+        centrality_np = np.array(state["graph_stats"]["centrality"])
+        clear_idx = np.where(f >= 0.85)[0]; jam_idx = np.where(f < 0.85)[0]
+        
+        # Hover-Over Intelligence Generator
+        def build_hover_text(idx):
+            u_id = nodes_list[idx]
+            name = stops_info[u_id]['name']
+            f_score = f[idx]
+            speed = state['live_speeds'].get(u_id, None)
+            
+            is_alerted = False
+            for r_id in state['wmata_official_alerts']:
+                if r_id in route_to_stops and u_id in route_to_stops[r_id]:
+                    is_alerted = True; break
+                    
+            speed_str = f"Live Speed: {speed:.1f} mph" if speed is not None else "No Live Buses"
+            alert_str = "⚠️ WMATA Alert Active" if is_alerted else "✅ Normal Service"
+            if u_id in state['injections']: alert_str = "🛑 SIMULATED INJECTION"
+            if u_id in state['bikeshare']['depleted_node_indices']: alert_str += "<br>🚲 Bikes Depleted"
+            if state['rail_alerts'] > 0 and surge_hubs_idx is not None and idx in surge_hubs_idx: alert_str += "<br>🚇 METRO HUB SURGE (Network Delay)"
+            if idx in state['rail_surges']: alert_str += "<br>🎯 PRECISION GROUND ZERO SURGE"
+            
+            return f"<b>{name}</b><br>Friction: {f_score:.2f}<br>{speed_str}<br>{alert_str}"
+
+        clear_x = coords[clear_idx, 1].tolist() if len(clear_idx) > 0 else []
+        clear_y = coords[clear_idx, 0].tolist() if len(clear_idx) > 0 else []
+        clear_z = z_vals[clear_idx].tolist() if len(clear_idx) > 0 else []
+        clear_txt = [build_hover_text(i) for i in clear_idx]
+        
+        jam_x = coords[jam_idx, 1].tolist() if len(jam_idx) > 0 else []
+        jam_y = coords[jam_idx, 0].tolist() if len(jam_idx) > 0 else []
+        jam_z = z_vals[jam_idx].tolist() if len(jam_idx) > 0 else []
+        jam_txt = [build_hover_text(i) for i in jam_idx]
+        jam_size = np.clip(centrality_np[jam_idx] * 1.5, 6, 25).tolist() if len(jam_idx) > 0 else []
+        jam_col = f[jam_idx].tolist() if len(jam_idx) > 0 else []
+
+        # Bikeshare
+        depleted = state['bikeshare']['depleted_node_indices']
+        bx = coords[depleted, 1].tolist() if len(depleted) > 0 else []
+        by = coords[depleted, 0].tolist() if len(depleted) > 0 else []
+        bz = z_vals[depleted].tolist() if len(depleted) > 0 else []
+        
+        node_to_meta = state['bikeshare'].get('node_to_metadata', {})
+        btxt = []
+        for i in depleted:
+            u_id = nodes_list[i]
+            stop_name = stops_info[u_id]['name']
+            meta = node_to_meta.get(i, None)
+            if meta:
+                btxt.append(f"🚲 <b>{meta['name']}</b> (Bikeshare)<br>Status: Depleted (Commuter Pressure)<br>Bikes Available: {meta['bikes']}/{meta['capacity']}<br>Empty Docks: {meta['docks']}<br>Snapped Stop: {stop_name}")
+            else:
+                btxt.append(f"🚲 <b>Capital Bikeshare Station</b><br>Status: Depleted<br>Snapped Stop: {stop_name}")
+
+        # Route Highlighting Mapping
+        route_map = {}
+        for r_id, stops in route_to_stops.items():
+            indices = [node_to_idx[s] for s in stops if s in node_to_idx]
+            if indices: route_map[r_id] = indices
+
+        # --- PHASE 4: MULTIMODAL SYNERGY METRICS CALCULATIONS ---
+        # Helper for spatial wavefront propagation
+        def haversine_distance(lat1, lon1, lat2, lon2):
+            R = 6371000.0 # Earth radius in meters
+            phi1 = np.radians(lat1)
+            phi2 = np.radians(lat2)
+            dphi = np.radians(lat2 - lat1)
+            dlambda = np.radians(lon2 - lon1)
+            a = np.sin(dphi/2.0)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda/2.0)**2
+            c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+            return R * c
+
+        # A. Panic Shift Index (Bikeshare depletion vs Metrorail delays)
+        curr_depl = set(state['bikeshare']['depleted_node_indices'])
+        prev_depl = state.setdefault('history_bikes_set', set())
+        new_depletions = curr_depl - prev_depl
+        state['history_bikes_set'] = curr_depl
+        
+        rail_factor = float(state['rail_alerts'])
+        panic_shift_val = len(new_depletions) * 15.0 * (1.0 + rail_factor)
+        panic_shift_val += len(curr_depl) * 0.5 * (1.0 + rail_factor)
+        panic_shift_idx = float(min(max(panic_shift_val, 0.0), 100.0))
+
+        # B. Congestion Wavefront Velocity (Incidents spreading speed)
+        incident_nodes = set(state['incidents']['dc'] + state['incidents']['md'] + state['incidents']['va'])
+        jammed_nodes = np.where(f < 0.85)[0]
+        velocities = []
+        new_history = {}
+        
+        for k in incident_nodes:
+            if len(jammed_nodes) > 0:
+                dists = haversine_distance(coords[k, 0], coords[k, 1], coords[jammed_nodes, 0], coords[jammed_nodes, 1])
+                max_dist = float(np.max(dists))
+            else:
+                max_dist = 0.0
+                
+            prev_max_dist = state['history_distances'].get(k, None)
+            if prev_max_dist is not None:
+                v_k = (max_dist - prev_max_dist) / 30.0
+                if v_k > 0:
+                    velocities.append(v_k)
+            new_history[k] = max_dist
+            
+        state['history_distances'] = new_history
+        wavefront_vel = max(velocities) if len(velocities) > 0 else 0.0
+        wavefront_vel = float(min(max(wavefront_vel, 0.0), 25.0))
+
+        # C. Frictional vs. Operational Latency Splits
+        frictional_sum = 0.0
+        operational_sum = 0.0
+        
+        for u_id in state['gtfs_delays'].keys():
+            delay = float(state['gtfs_delays'][u_id])
+            if delay <= 0: continue
+            
+            speed = state['live_speeds'].get(u_id, None)
+            if speed is not None:
+                p_i = 1.0 - min(max(speed / 20.0, 0.01), 1.0)
+                f_delay = delay * p_i
+                o_delay = delay - f_delay
+                frictional_sum += f_delay
+                operational_sum += o_delay
+            else:
+                idx = node_to_idx.get(u_id, None)
+                if idx is not None:
+                    p_i = 1.0 - float(f[idx])
+                    f_delay = delay * p_i
+                    o_delay = delay - f_delay
+                    frictional_sum += f_delay
+                    operational_sum += o_delay
+                else:
+                    operational_sum += delay
+        
+        total_latency = frictional_sum + operational_sum
+        if total_latency > 0:
+            gridlock_split_pct = float((frictional_sum / total_latency) * 100.0)
+            ops_split_pct = float((operational_sum / total_latency) * 100.0)
+        else:
+            gridlock_split_pct = 50.0
+            ops_split_pct = 50.0
+
+        # D. Dynamic Weather Drag Coefficient
+        V = np.mean(list(state['live_speeds'].values())) if state['live_speeds'] else 14.5
+        P = float(state['precipitation_rate'])
+        
+        ema = state['weather_ema']
+        alpha_ema = 0.95
+        ema['V'] = alpha_ema * ema['V'] + (1.0 - alpha_ema) * V
+        ema['P'] = alpha_ema * ema['P'] + (1.0 - alpha_ema) * P
+        ema['VP'] = alpha_ema * ema['VP'] + (1.0 - alpha_ema) * (V * P)
+        ema['P2'] = alpha_ema * ema['P2'] + (1.0 - alpha_ema) * (P * P)
+        
+        cov_VP = ema['VP'] - ema['V'] * ema['P']
+        var_P = ema['P2'] - ema['P'] * ema['P']
+        
+        if var_P > 1e-4:
+            weather_drag_coeff = -cov_VP / var_P
+        else:
+            weather_drag_coeff = 0.5
+        weather_drag_coeff = float(min(max(weather_drag_coeff, 0.1), 5.0))
+
+        # Assemble Live Data Payload
+        live_data = {
+            "timestamp": time.time(),
+            "cycle": state['total_cycles'],
+            "metrics": {
+                "l2": float(l2), "gap": float(gap), "weather": state['weather_desc'], "penalty": float(state['weather_penalty']),
+                "dc": len(state['incidents']['dc']), "md": len(state['incidents']['md']), "va": len(state['incidents']['va']),
+                "bike": state['bikeshare']['depleted_stations'], "alerts": state['graph_stats'].get('active_alerts', 0), "rail_alerts": state.get('rail_alerts', 0),
+                "xray_wins": state['scoreboard_stats']['xray_wins'], "wmata_wins": state['scoreboard_stats']['wmata_wins'], 
+                "avg_lead": round(state['scoreboard_stats']['avg_lead_time_sec'] / 60, 1),
+                "panic_shift": panic_shift_idx,
+                "wavefront_velocity": wavefront_vel,
+                "gridlock_split": gridlock_split_pct,
+                "ops_split": ops_split_pct,
+                "weather_drag": weather_drag_coeff
+            },
+            "gx": gx, "gy": gy, "gz": gz, "wx1": wx1, "wy1": wy1, "wz1": wz1, "wx2": wx2, "wy2": wy2, "wz2": wz2, "fx": fx, "fy": fy, "fz": fz,
+            "cx": clear_x, "cy": clear_y, "cz": clear_z, "ctxt": clear_txt,
+            "jx": jam_x, "jy": jam_y, "jz": jam_z, "jtxt": jam_txt, "jsiz": jam_size, "jcol": jam_col,
+            "bx": bx, "by": by, "bz": bz, "btxt": btxt,
+            "routes": route_map,
+            "buses": list(state.get('bus_positions_dict', {}).values()),
+            "trains": state.get('train_positions', []),
+            "bisection": {
+                "partitions": partitions.tolist(),
+                "bx_bound": bx_bound,
+                "by_bound": by_bound,
+                "bz_bound": bz_bound
+            }
+        }
+        
+        # --- DVR BUFFER EXPORT ---
+        with open("static/live_data.json", "w") as f_json: json.dump(live_data, f_json)
+        
+        # Save to historical buffer (keep last 30 cycles = ~15 mins)
+        history_dir = "static/history"
+        if not os.path.exists(history_dir): os.makedirs(history_dir)
+        
+        # We use modulo 30 to rotate files 0-29
+        cycle_idx = state['total_cycles'] % 30
+        with open(f"{history_dir}/frame_{cycle_idx}.json", "w") as f_hist: json.dump(live_data, f_hist)
+        
+        # Write manifest so UI knows the latest frame and total frames available
+        with open("static/manifest.json", "w") as f_man: 
+            json.dump({"latest_frame": cycle_idx, "total_cycles": state['total_cycles']}, f_man)
+            
+    except (OSError, TypeError, ValueError, KeyError) as e:
+        print(f"Export Error: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
 async def main_loop(W, nodes_list, node_to_idx, stops_info, tree, route_to_stops):
     W_mask = W.copy(); W_mask.data[:] = 1.0
@@ -1141,515 +1707,41 @@ async def main_loop(W, nodes_list, node_to_idx, stops_info, tree, route_to_stops
     last_f = None
     
     while True:
-        loop_start = time.time(); state["total_cycles"] += 1
-        f = np.ones(len(nodes_list), dtype=np.float32) * state['weather_penalty']
+        loop_start = time.time()
+        state["total_cycles"] += 1
         
-        # Mathematical Tau Wiggle: Break degenerate eigenvalue symmetry ties.
-        # This microscopic deterministic noise ensures the Fiedler bisection is mathematically 
-        # stable and unique, preventing the Z-axis topology from snapping between orthogonal bases.
-        f += 1e-5 * np.sin(math.tau * np.arange(len(nodes_list)) / len(nodes_list))
+        # 1. Friction field calculation
+        f, W_weighted, l2, v2, gap, lat = compute_friction_field(
+            state, W_mask, nodes_list, node_to_idx, stops_info, surge_hubs_idx,
+            D_inv, last_f, last_l2, last_v2, last_gap, loop_start
+        )
         
-        total_delay = 0
-        
-        # Apply Metrorail Surface Surge
-        if state['rail_alerts'] > 0:
-            for idx in surge_hubs_idx: f[idx] *= 0.7
-            
-        # Precision Ground Zero Surges
-        for idx in state['rail_surges']:
-            f[idx] *= 0.6
-            
-        # We don't use gtfs_delays anymore because WMATA doesn't populate it.
-        # Instead, we use physical live speeds from VehiclePositions.
-        for s_id, speeds in state.get('live_speeds_list', {}).items():
-            if s_id in node_to_idx:
-                idx = node_to_idx[s_id]
-                n_severe = sum(1 for speed in speeds if speed < 5.0)
-                m_heavy = sum(1 for speed in speeds if 5.0 <= speed < 15.0)
-                if n_severe > 0 or m_heavy > 0:
-                    penalty = (0.3 ** min(n_severe, 3)) * (0.6 ** min(m_heavy, 3))
-                    f[idx] *= penalty
-                    f[idx] = max(f[idx], 0.01)
-        
-        # HARDCORE REFEREE MODE: WMATA alerts DO NOT apply friction to the map anymore.
-        # The Engine must catch gridlock purely through physical physics (speed < 5mph).
-        
-        if os.path.exists("sim_state.json"):
-            try:
-                with open("sim_state.json", "r") as f_sim: state['injections'] = json.load(f_sim).get("injected_nodes", [])
-            except: pass
-        for region in state['incidents'].values():
-            for idx in region: f[idx] = 0.05
-        for s_id in state['injections']:
-            if s_id in node_to_idx: f[node_to_idx[s_id]] = 0.01
-        
-        # Apply Spatial Friction Diffusion (Graph Heat Kernel)
-        # Penalties bleed onto topological neighbors, simulating physical tailbacks upstream of blockages.
-        D_inv_W_f = D_inv * (W_mask @ f)
-        f = (1.0 - ALPHA_DIFFUSION) * f + ALPHA_DIFFUSION * D_inv_W_f
-        f = np.clip(smooth_floor(f), 0.01, 1.0)
-        
-        W = sp.diags(f) @ W_mask @ sp.diags(f)
-        
-        if last_f is not None:
-            f_diff_l2 = float(np.linalg.norm(f - last_f))
-        else:
-            f_diff_l2 = 1.0
-            
-        if last_f is not None and f_diff_l2 < 1e-3:
-            l2 = last_l2
-            v2 = last_v2
-            gap = last_gap
-        else:
-            try:
-                l2, v2, gap = spectral_analysis(W, f, last_v2)
-                if l2 == 0 and np.all(v2 == 0):
-                    l2 = last_l2 if last_l2 is not None else 0.05
-                    v2 = last_v2 if last_v2 is not None else np.zeros(len(nodes_list))
-                    gap = last_gap if last_gap is not None else 0.05
-                    print("⚠️ [Solver Warning] Spectral convergence failed. Using topological fallback values.")
-            except Exception as solver_err:
-                l2 = last_l2 if last_l2 is not None else 0.05
-                v2 = last_v2 if last_v2 is not None else np.zeros(len(nodes_list))
-                gap = last_gap if last_gap is not None else 0.05
-                print(f"⚠️ [Solver Exception] Mathematical error: {solver_err}. Using topological fallback values.")
-
+        # Keep tracking states
         last_f = f.copy()
         last_l2 = l2
         last_v2 = v2
         last_gap = gap
-
-        lat = (time.time() - loop_start) * 1000
-        # Safe v2 formatting for graph_stats
-        v2_for_stats = v2 if v2 is not None else np.zeros(len(nodes_list))
-        worst_idx = np.argmin(f)
-        state["graph_stats"].update({
-            "compute_latency": lat, 
-            "peak_latency": max(state["graph_stats"]["peak_latency"], lat), 
-            "avg_friction": np.mean(f), 
-            "system_tension": np.std(f), 
-            "spectral_gap": gap, 
-            "total_delay_sec": total_delay, 
-            "fiedler_max": v2_for_stats[np.argmax(np.abs(v2_for_stats))] if len(v2_for_stats) > 0 else 0.0, 
-            "fiedler_pole_name": stops_info[nodes_list[np.argmax(np.abs(v2_for_stats))]]['name'] if len(v2_for_stats) > 0 else "Core", 
-            "worst_node_name": stops_info[nodes_list[worst_idx]]['name'] if worst_idx < len(nodes_list) else "None"
-        })
         
-        # --- FRACTURE DIAGNOSTICS & TARGET ACQUISITION ---
-        fractures = []
-        stressed_idx = np.where(W.data < thresholds)[0]
+        # 2. Fracture diagnostics
+        fractures = detect_fractures(
+            state, W_weighted, thresholds, rows, nodes_list, stops_info, route_to_stops
+        )
         
-        if len(stressed_idx) > 0:
-            sorted_stress = stressed_idx[np.argsort(W.data[stressed_idx])]
-            seen_edges = set()
-            
-            for idx in sorted_stress:
-                weight = W.data[idx]
-                r = rows[idx]
-                c = W.indices[idx]
-                
-                edge_key = tuple(sorted([r, c]))
-                if edge_key in seen_edges: continue
-                seen_edges.add(edge_key)
-                
-                u_id, v_id = nodes_list[r], nodes_list[c]
-                u_name, v_name = stops_info[u_id]['name'], stops_info[v_id]['name']
-                
-                cause = "Cascading Bus Delays"
-                delay_sec = max(state['gtfs_delays'].get(u_id, 0), state['gtfs_delays'].get(v_id, 0))
-                
-                if u_id in state['injections'] or v_id in state['injections']: cause = "🛑 SIMULATED INJECTION"
-                elif r in state['incidents']['dc'] or c in state['incidents']['dc'] or r in state['incidents']['md'] or c in state['incidents']['md'] or r in state['incidents']['va'] or c in state['incidents']['va']: cause = "🚓 MUNICIPAL INCIDENT (Crash/Closure)"
-                else:
-                    is_alerted = False
-                    for r_id in state['wmata_official_alerts']:
-                        if r_id in route_to_stops and (u_id in route_to_stops[r_id] or v_id in route_to_stops[r_id]):
-                            is_alerted = True; break
-                    if is_alerted: cause = "⚠️ WMATA SERVICE ALERT"
-                    elif state['live_speeds'].get(u_id, 20) < 5 or state['live_speeds'].get(v_id, 20) < 5:
-                        cause = "🚗 LOW VELOCITY SENSOR (< 5mph)"
-                    elif delay_sec > 0: cause = f"🚌 SEVERE DELAY ({delay_sec}s reported)"
-                
-                fractures.append({"u": u_name, "v": v_name, "w": weight, "cause": cause, "u_id": u_id})
-                
-                # --- CANARY LOCK-ON ---
-                # Reverse-map stop_id to route_ids (naive approach for demonstration)
-                for r_id, stops in route_to_stops.items():
-                    if u_id in stops and r_id not in state['active_predictions'] and len(state['canary_buses']) < 5:
-                        # Grab a REAL bus currently on this route
-                        available_buses = state.get('live_buses', {}).get(r_id, [])
-                        if available_buses:
-                            canary_vid = available_buses[0] # Pick the first real bus
-                            state['canary_buses'][canary_vid] = {"route_id": r_id, "target": u_name, "status": "Acquiring Target..."}
-                            
-                            # If WMATA already has an alert out, they beat us to it.
-                            initial_t_wmata = time.time() - 1 if r_id in state['wmata_official_alerts'] else None
-                            state['active_predictions'][r_id] = {"t_engine": time.time(), "t_physical": None, "t_wmata": initial_t_wmata, "cause": cause, "resolved": False, "pre_existing": r_id in state['wmata_official_alerts']}
-                
-                if len(fractures) >= 15: break
-
-        # --- ADJUDICATION ENGINE & HEALING PROTOCOL ---
-        current_time = time.time()
-        for r_id, pred in list(state['active_predictions'].items()):
-            if not pred['resolved']:
-                # Check if WMATA finally issued an alert
-                if r_id in state['wmata_official_alerts'] and pred['t_wmata'] is None:
-                    pred['t_wmata'] = current_time
-                
-                # Condition 1: Both physical confirmation and WMATA alert occurred
-                if pred['t_physical'] is not None and pred['t_wmata'] is not None:
-                    lead_time = pred['t_wmata'] - pred['t_engine']
-                    
-                    if pred.get('pre_existing', False):
-                        winner = "WMATA"
-                        lead_time = 0 # Don't skew the average with fake negative time
-                    else:
-                        if lead_time > 60: winner = "X-RAY"
-                        elif lead_time > -60: winner = "TIE"
-                        else: winner = "WMATA"
-                    
-                    if winner == "X-RAY": state['scoreboard_stats']['xray_wins'] += 1
-                    elif winner == "WMATA": state['scoreboard_stats']['wmata_wins'] += 1
-                    
-                    # Only calculate average for actual races, not pre-existing conditions
-                    if not pred.get('pre_existing', False):
-                        state['scoreboard_stats']['total_races'] += 1
-                        state['scoreboard_stats']['avg_lead_time_sec'] = ((state['scoreboard_stats']['avg_lead_time_sec'] * (state['scoreboard_stats']['total_races'] - 1)) + lead_time) / state['scoreboard_stats']['total_races']
-                    
-                    try:
-                        with open(SCOREBOARD_FILE, 'a', newline='') as f_score:
-                            csv.writer(f_score).writerow([time.strftime('%Y-%m-%d %H:%M:%S'), r_id, pred['cause'], pred['t_engine'], pred['t_physical'], pred['t_wmata'], lead_time, winner])
-                    except: pass
-                    
-                    pred['resolved'] = True
-                    
-                # Condition 2: Healing Protocol / Timeout
-                # If 15 minutes (900s) have passed and WMATA never alerted, it was an Unreported Micro-Jam
-                elif (current_time - pred['t_engine']) > 900 and pred['t_wmata'] is None:
-                    # If we got physical confirmation, it was a real jam they missed. If not, it was just math noise.
-                    final_cause = "UNREPORTED MICRO-JAM" if pred['t_physical'] else "GHOST FRACTURE (HEALED)"
-                    
-                    # We still award X-Ray the win if it was a real, physical micro-jam.
-                    if pred['t_physical']:
-                        state['scoreboard_stats']['xray_wins'] += 1
-                        # We give a flat +15m lead time for catching something they entirely missed
-                        lead_time = 900 
-                        state['scoreboard_stats']['total_races'] += 1
-                        state['scoreboard_stats']['avg_lead_time_sec'] = ((state['scoreboard_stats']['avg_lead_time_sec'] * (state['scoreboard_stats']['total_races'] - 1)) + lead_time) / state['scoreboard_stats']['total_races']
-                    else:
-                        lead_time = 0
-                        
-                    try:
-                        with open(SCOREBOARD_FILE, 'a', newline='') as f_score:
-                            csv.writer(f_score).writerow([time.strftime('%Y-%m-%d %H:%M:%S'), r_id, final_cause, pred['t_engine'], pred['t_physical'], "NEVER", lead_time, "X-RAY (UNREPORTED)"])
-                    except: pass
-                    
-                    pred['resolved'] = True
-                
-                # Cleanup Canaries if resolved
-                if pred['resolved']:
-                    keys_to_delete = [vid for vid, info in state['canary_buses'].items() if info['route_id'] == r_id]
-                    for k in keys_to_delete: del state['canary_buses'][k]
-                    del state['active_predictions'][r_id]
-
-        os.system('clear'); uptime = time.time() - state["engine_start"]; freshness = time.time() - state["last_payload_ts"] if state["last_payload_ts"] > 0 else 0
-        print(f"🛰️  DMV GRIDLOCK X-RAY | {time.strftime('%X')} | CYCLE: {state['total_cycles']}\n{'='*80}\n🌍 TOPOLOGY: {state['graph_stats']['active_nodes']} Nodes | {state['graph_stats']['active_edges']} Edges\n🌤️  WEATHER:  {state['weather_desc']} ({state['weather_penalty']:.2f})\n📍 INCIDENTS: DC:{len(state['incidents']['dc'])} | MD:{len(state['incidents']['md'])} | VA:{len(state['incidents']['va'])}\n🚲 BIKESHARE: {state['bikeshare']['total_bikes']} Bikes | {state['bikeshare']['depleted_stations']} Empty Stations\n📢 ALERTS:    {state['graph_stats']['active_alerts']} Bus | {state['rail_alerts']} Metrorail\n{'-'*80}\n📊 SYSTEM PULSE:\n   Connectivity (λ2): {l2:.8f} [{'🟢 Stable' if l2 > 0.0001 else '🔴 Critical'}]\n   Spectral Gap:     {gap:.8f}\n   Avg Node Flow:    {state['graph_stats']['avg_friction']:.4f}\n   System Tension:   {state['graph_stats']['system_tension']:.4f}\n{'-'*80}")
+        # 3. Adjudication
+        adjudicate_predictions(state, time.time())
         
-        print("🏆 PREDICTION SCOREBOARD:")
-        avg_lead_mins = state['scoreboard_stats']['avg_lead_time_sec'] / 60
-        print(f"   X-Ray Wins: {state['scoreboard_stats']['xray_wins']} | WMATA Wins: {state['scoreboard_stats']['wmata_wins']} | Avg Lead Time: +{avg_lead_mins:.1f}m")
+        # 4. Display
+        uptime = time.time() - state["engine_start"]
+        freshness = time.time() - state["last_payload_ts"] if state["last_payload_ts"] > 0 else 0
+        print_console_dashboard(state, l2, gap, f, fractures, lat, uptime, freshness)
         
-        print("\n🚌 CANARY TRACKER (Live GPS Target Lock):")
-        if not state['canary_buses']: print("   [Standby] No active predictions. Scanning...")
-        for vid, info in state['canary_buses'].items():
-            print(f"   [LOCKED] Route {info['route_id']} approaching {info['target'][:15]}... | {info['status']}")
-
-        print(f"\n🚨 ACTIVE FRACTURES (Top 15):")
-        if not fractures: print("   ✅ Grid is flowing nominally.")
-        else:
-            for i, frac in enumerate(fractures, 1):
-                print(f"   {i}. {frac['u']} ➔ {frac['v']}\n      └─ Friction: {frac['w']:.4f} | Cause: {frac['cause']}")
-                
-        print(f"{'-'*80}\n⚡ COMPUTE: {lat:.2f}ms | Uptime: {int(uptime//3600)}h {int((uptime%3600)//60)}m | Data: {int(freshness)}s\n{'='*80}")
-
-
+        # 5. Telemetry & Export
         log_telemetry(time.strftime('%Y-%m-%d %H:%M:%S'), l2, gap, state["graph_stats"]["avg_friction"], len(state['incidents']['dc']), len(state['incidents']['md']), len(state['incidents']['va']), state['bikeshare']['depleted_stations'], lat)
-        # --- STATE EXPORT FOR 3D VIZ (Atomic Write) ---
-        try:
-            target_path = "network_state.npz"; tmp_path = "network_state_tmp"; coords = np.array([[stops_info[nid]['lat'], stops_info[nid]['lon']] for nid in nodes_list])
-            
-            # Dynamic Spectral Bisection partitioning based on Fiedler median split
-            partitions = np.where(v2 >= np.median(v2), 0, 1)
-            
-            np.savez_compressed(tmp_path, nodes=np.array(nodes_list), names=np.array([stops_info[nid]['name'] for nid in nodes_list]), v_2=v2, coords=coords, weights=W.data, indices=W.indices, indptr=W.indptr, node_friction=f, lambda_2=np.array([l2]), spectral_gap=np.array([gap]), weather_penalty=np.array([state['weather_penalty']]), weather_desc=np.array([state['weather_desc']]), incidents_dc=np.array([len(state['incidents']['dc'])]), incidents_md=np.array([len(state['incidents']['md'])]), incidents_va=np.array([len(state['incidents']['va'])]), bikeshare_depleted=np.array([state['bikeshare']['depleted_stations']]), depleted_indices=np.array(state['bikeshare']['depleted_node_indices']), centrality=np.array(state["graph_stats"]["centrality"]), active_alerts=np.array([state['graph_stats'].get('active_alerts', 0)]), partitions=partitions)
-            if os.path.exists(tmp_path + ".npz"): os.replace(tmp_path + ".npz", target_path)
-            
-            # Export JSON for the isolated WebGL iframe
-            z_vals = v2 * 150
-            gx = coords[:, 1].tolist(); gy = coords[:, 0].tolist(); gz = [0] * len(nodes_list)
-
-            # Extract boundary crossing edges (choke-points) crossing partitions
-            diff_partition = partitions[rows] != partitions[W_mask.indices]
-            boundary_mask = diff_partition & (rows < W_mask.indices)
-            bx_bound, by_bound, bz_bound = [], [], []
-            for b_idx in np.where(boundary_mask)[0]:
-                r_n = rows[b_idx]
-                c_n = W_mask.indices[b_idx]
-                bx_bound.extend([float(coords[r_n, 1]), float(coords[c_n, 1]), None])
-                by_bound.extend([float(coords[r_n, 0]), float(coords[c_n, 0]), None])
-                bz_bound.extend([float(z_vals[r_n]), float(z_vals[c_n]), None])
-
-            # Neural Web (Split into two traces with Bezier Arcs for Express Routes)
-            wx1, wy1, wz1 = [], [], []
-            wx2, wy2, wz2 = [], [], []
-            midpoint = len(W.indptr) // 2
-            
-            def get_arc(x0, y0, z0, x2, y2, z2):
-                dist = math.hypot(x2 - x0, y2 - y0)
-                if dist < 0.04: # Less than ~4km, keep it a straight line (2 points)
-                    return [x0, x2], [y0, y2], [z0, z2]
-                # Long express route -> 5-point Bezier Arc
-                x1 = (x0 + x2) / 2; y1 = (y0 + y2) / 2; z1 = max(z0, z2) + (dist * 250)
-                xs, ys, zs = [], [], []
-                for t in [0, 0.25, 0.5, 0.75, 1.0]:
-                    xs.append((1-t)**2 * x0 + 2*(1-t)*t * x1 + t**2 * x2)
-                    ys.append((1-t)**2 * y0 + 2*(1-t)*t * y1 + t**2 * y2)
-                    zs.append((1-t)**2 * z0 + 2*(1-t)*t * z1 + t**2 * z2)
-                return xs, ys, zs
-
-            for i in range(0, len(W.indptr)-1, 1):
-                for j in range(W.indptr[i], W.indptr[i+1]):
-                    target = W.indices[j]
-                    if i < target: # Deduplicate symmetric edges
-                        ax, ay, az = get_arc(float(coords[i, 1]), float(coords[i, 0]), float(z_vals[i]), float(coords[target, 1]), float(coords[target, 0]), float(z_vals[target]))
-                        if i < midpoint:
-                            wx1.extend(ax + [None]); wy1.extend(ay + [None]); wz1.extend(az + [None])
-                        else:
-                            wx2.extend(ax + [None]); wy2.extend(ay + [None]); wz2.extend(az + [None])
-
-            # Fractures
-            stressed_idx = np.where(W.data < thresholds)[0]
-            fx, fy, fz = [], [], []
-            for idx in stressed_idx:
-                r = rows[idx]; c = W.indices[idx]
-                if r < c: # Deduplicate symmetric fractures
-                    fx.extend([float(coords[r, 1]), float(coords[c, 1]), None])
-                    fy.extend([float(coords[r, 0]), float(coords[c, 0]), None])
-                    fz.extend([float(z_vals[r]), float(z_vals[c]), None])
-
-            # Hubs
-            centrality_np = np.array(state["graph_stats"]["centrality"])
-            clear_idx = np.where(f >= 0.85)[0]; jam_idx = np.where(f < 0.85)[0]
-            
-            # Hover-Over Intelligence Generator
-            def build_hover_text(idx):
-                u_id = nodes_list[idx]
-                name = stops_info[u_id]['name']
-                f_score = f[idx]
-                speed = state['live_speeds'].get(u_id, None)
-                
-                is_alerted = False
-                for r_id in state['wmata_official_alerts']:
-                    if r_id in route_to_stops and u_id in route_to_stops[r_id]:
-                        is_alerted = True; break
-                        
-                speed_str = f"Live Speed: {speed:.1f} mph" if speed is not None else "No Live Buses"
-                alert_str = "⚠️ WMATA Alert Active" if is_alerted else "✅ Normal Service"
-                if u_id in state['injections']: alert_str = "🛑 SIMULATED INJECTION"
-                if u_id in state['bikeshare']['depleted_node_indices']: alert_str += "<br>🚲 Bikes Depleted"
-                if state['rail_alerts'] > 0 and idx in surge_hubs_idx: alert_str += "<br>🚇 METRO HUB SURGE (Network Delay)"
-                if idx in state['rail_surges']: alert_str += "<br>🎯 PRECISION GROUND ZERO SURGE"
-                
-                return f"<b>{name}</b><br>Friction: {f_score:.2f}<br>{speed_str}<br>{alert_str}"
-
-            clear_x = coords[clear_idx, 1].tolist() if len(clear_idx) > 0 else []
-            clear_y = coords[clear_idx, 0].tolist() if len(clear_idx) > 0 else []
-            clear_z = z_vals[clear_idx].tolist() if len(clear_idx) > 0 else []
-            clear_txt = [build_hover_text(i) for i in clear_idx]
-            
-            jam_x = coords[jam_idx, 1].tolist() if len(jam_idx) > 0 else []
-            jam_y = coords[jam_idx, 0].tolist() if len(jam_idx) > 0 else []
-            jam_z = z_vals[jam_idx].tolist() if len(jam_idx) > 0 else []
-            jam_txt = [build_hover_text(i) for i in jam_idx]
-            jam_size = np.clip(centrality_np[jam_idx] * 1.5, 6, 25).tolist() if len(jam_idx) > 0 else []
-            jam_col = f[jam_idx].tolist() if len(jam_idx) > 0 else []
-
-            # Bikeshare
-            depleted = state['bikeshare']['depleted_node_indices']
-            bx = coords[depleted, 1].tolist() if len(depleted) > 0 else []
-            by = coords[depleted, 0].tolist() if len(depleted) > 0 else []
-            bz = z_vals[depleted].tolist() if len(depleted) > 0 else []
-            
-            node_to_meta = state['bikeshare'].get('node_to_metadata', {})
-            btxt = []
-            for i in depleted:
-                u_id = nodes_list[i]
-                stop_name = stops_info[u_id]['name']
-                meta = node_to_meta.get(i, None)
-                if meta:
-                    btxt.append(f"🚲 <b>{meta['name']}</b> (Bikeshare)<br>Status: Depleted (Commuter Pressure)<br>Bikes Available: {meta['bikes']}/{meta['capacity']}<br>Empty Docks: {meta['docks']}<br>Snapped Stop: {stop_name}")
-                else:
-                    btxt.append(f"🚲 <b>Capital Bikeshare Station</b><br>Status: Depleted<br>Snapped Stop: {stop_name}")
-
-            # Route Highlighting Mapping
-            route_map = {}
-            for r_id, stops in route_to_stops.items():
-                indices = [node_to_idx[s] for s in stops if s in node_to_idx]
-                if indices: route_map[r_id] = indices
-
-            # --- PHASE 4: MULTIMODAL SYNERGY METRICS CALCULATIONS ---
-            # Helper for spatial wavefront propagation
-            def haversine_distance(lat1, lon1, lat2, lon2):
-                R = 6371000.0 # Earth radius in meters
-                phi1 = np.radians(lat1)
-                phi2 = np.radians(lat2)
-                dphi = np.radians(lat2 - lat1)
-                dlambda = np.radians(lon2 - lon1)
-                a = np.sin(dphi/2.0)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda/2.0)**2
-                c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
-                return R * c
-
-            # A. Panic Shift Index (Bikeshare depletion vs Metrorail delays)
-            curr_depl = set(state['bikeshare']['depleted_node_indices'])
-            prev_depl = state.setdefault('history_bikes_set', set())
-            new_depletions = curr_depl - prev_depl
-            state['history_bikes_set'] = curr_depl
-            
-            rail_factor = float(state['rail_alerts'])
-            panic_shift_val = len(new_depletions) * 15.0 * (1.0 + rail_factor)
-            panic_shift_val += len(curr_depl) * 0.5 * (1.0 + rail_factor)
-            panic_shift_idx = float(min(max(panic_shift_val, 0.0), 100.0))
-
-            # B. Congestion Wavefront Velocity (Incidents spreading speed)
-            incident_nodes = set(state['incidents']['dc'] + state['incidents']['md'] + state['incidents']['va'])
-            jammed_nodes = np.where(f < 0.85)[0]
-            velocities = []
-            new_history = {}
-            
-            for k in incident_nodes:
-                if len(jammed_nodes) > 0:
-                    dists = haversine_distance(coords[k, 0], coords[k, 1], coords[jammed_nodes, 0], coords[jammed_nodes, 1])
-                    max_dist = float(np.max(dists))
-                else:
-                    max_dist = 0.0
-                    
-                prev_max_dist = state['history_distances'].get(k, None)
-                if prev_max_dist is not None:
-                    v_k = (max_dist - prev_max_dist) / 30.0
-                    if v_k > 0:
-                        velocities.append(v_k)
-                new_history[k] = max_dist
-                
-            state['history_distances'] = new_history
-            wavefront_vel = max(velocities) if len(velocities) > 0 else 0.0
-            wavefront_vel = float(min(max(wavefront_vel, 0.0), 25.0))
-
-            # C. Frictional vs. Operational Latency Splits
-            frictional_sum = 0.0
-            operational_sum = 0.0
-            
-            for u_id in state['gtfs_delays'].keys():
-                delay = float(state['gtfs_delays'][u_id])
-                if delay <= 0: continue
-                
-                speed = state['live_speeds'].get(u_id, None)
-                if speed is not None:
-                    p_i = 1.0 - min(max(speed / 20.0, 0.01), 1.0)
-                    f_delay = delay * p_i
-                    o_delay = delay - f_delay
-                    frictional_sum += f_delay
-                    operational_sum += o_delay
-                else:
-                    idx = node_to_idx.get(u_id, None)
-                    if idx is not None:
-                        p_i = 1.0 - float(f[idx])
-                        f_delay = delay * p_i
-                        o_delay = delay - f_delay
-                        frictional_sum += f_delay
-                        operational_sum += o_delay
-                    else:
-                        operational_sum += delay
-            
-            total_latency = frictional_sum + operational_sum
-            if total_latency > 0:
-                gridlock_split_pct = float((frictional_sum / total_latency) * 100.0)
-                ops_split_pct = float((operational_sum / total_latency) * 100.0)
-            else:
-                gridlock_split_pct = 50.0
-                ops_split_pct = 50.0
-
-            # D. Dynamic Weather Drag Coefficient
-            V = np.mean(list(state['live_speeds'].values())) if state['live_speeds'] else 14.5
-            P = float(state['precipitation_rate'])
-            
-            ema = state['weather_ema']
-            alpha_ema = 0.95
-            ema['V'] = alpha_ema * ema['V'] + (1.0 - alpha_ema) * V
-            ema['P'] = alpha_ema * ema['P'] + (1.0 - alpha_ema) * P
-            ema['VP'] = alpha_ema * ema['VP'] + (1.0 - alpha_ema) * (V * P)
-            ema['P2'] = alpha_ema * ema['P2'] + (1.0 - alpha_ema) * (P * P)
-            
-            cov_VP = ema['VP'] - ema['V'] * ema['P']
-            var_P = ema['P2'] - ema['P'] * ema['P']
-            
-            if var_P > 1e-4:
-                weather_drag_coeff = -cov_VP / var_P
-            else:
-                weather_drag_coeff = 0.5
-            weather_drag_coeff = float(min(max(weather_drag_coeff, 0.1), 5.0))
-
-            # Assemble Live Data Payload
-            live_data = {
-                "timestamp": time.time(),
-                "cycle": state['total_cycles'],
-                "metrics": {
-                    "l2": float(l2), "gap": float(gap), "weather": state['weather_desc'], "penalty": float(state['weather_penalty']),
-                    "dc": len(state['incidents']['dc']), "md": len(state['incidents']['md']), "va": len(state['incidents']['va']),
-                    "bike": state['bikeshare']['depleted_stations'], "alerts": state['graph_stats'].get('active_alerts', 0), "rail_alerts": state.get('rail_alerts', 0),
-                    "xray_wins": state['scoreboard_stats']['xray_wins'], "wmata_wins": state['scoreboard_stats']['wmata_wins'], 
-                    "avg_lead": round(state['scoreboard_stats']['avg_lead_time_sec'] / 60, 1),
-                    "panic_shift": panic_shift_idx,
-                    "wavefront_velocity": wavefront_vel,
-                    "gridlock_split": gridlock_split_pct,
-                    "ops_split": ops_split_pct,
-                    "weather_drag": weather_drag_coeff
-                },
-                "gx": gx, "gy": gy, "gz": gz, "wx1": wx1, "wy1": wy1, "wz1": wz1, "wx2": wx2, "wy2": wy2, "wz2": wz2, "fx": fx, "fy": fy, "fz": fz,
-                "cx": clear_x, "cy": clear_y, "cz": clear_z, "ctxt": clear_txt,
-                "jx": jam_x, "jy": jam_y, "jz": jam_z, "jtxt": jam_txt, "jsiz": jam_size, "jcol": jam_col,
-                "bx": bx, "by": by, "bz": bz, "btxt": btxt,
-                "routes": route_map,
-                "buses": list(state.get('bus_positions_dict', {}).values()),
-                "trains": state.get('train_positions', []),
-                "bisection": {
-                    "partitions": partitions.tolist(),
-                    "bx_bound": bx_bound,
-                    "by_bound": by_bound,
-                    "bz_bound": bz_bound
-                }
-            }
-            
-            # --- DVR BUFFER EXPORT ---
-            # Save the current state to the live file
-            with open("static/live_data.json", "w") as f_json: json.dump(live_data, f_json)
-            
-            # Save to historical buffer (keep last 30 cycles = ~15 mins)
-            history_dir = "static/history"
-            if not os.path.exists(history_dir): os.makedirs(history_dir)
-            
-            # We use modulo 30 to rotate files 0-29
-            cycle_idx = state['total_cycles'] % 30
-            with open(f"{history_dir}/frame_{cycle_idx}.json", "w") as f_hist: json.dump(live_data, f_hist)
-            
-            # Write manifest so UI knows the latest frame and total frames available
-            with open("static/manifest.json", "w") as f_man: 
-                json.dump({"latest_frame": cycle_idx, "total_cycles": state['total_cycles']}, f_man)
-                
-        except Exception as e:
-            import traceback
-            print(f"Export Error: {e}")
-            traceback.print_exc()
-
+        export_visualization_data(
+            state, v2, l2, gap, f, W_weighted, nodes_list, stops_info, route_to_stops,
+            node_to_idx, thresholds, rows, W_mask, surge_hubs_idx
+        )
+        
         await asyncio.sleep(max(0, POLL_INTERVAL_GTFS - (time.time() - loop_start)))
 
 async def main():
