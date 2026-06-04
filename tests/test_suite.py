@@ -2,6 +2,7 @@ import os
 import sys
 import math
 import unittest
+from unittest.mock import Mock, patch
 import time
 import tempfile
 import shutil
@@ -17,6 +18,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import engine
 import server
+import utils
 
 class TestDMVGridlockXRays(unittest.TestCase):
     @classmethod
@@ -1063,36 +1065,74 @@ class TestOptimizedEngineAdditional(unittest.TestCase):
     def test_crosses_river_true(self):
         """Verify that crosses_river returns True for coordinates crossing the Potomac barrier."""
         # Across Potomac: (38.990, -77.160) to (38.990, -77.120)
-        self.assertTrue(engine.crosses_river(38.990, -77.160, 38.990, -77.120))
+        self.assertTrue(utils.crosses_river(38.990, -77.160, 38.990, -77.120))
         # Across Anacostia: (38.900, -76.980) to (38.900, -76.950)
-        self.assertTrue(engine.crosses_river(38.900, -76.980, 38.900, -76.950))
+        self.assertTrue(utils.crosses_river(38.900, -76.980, 38.900, -76.950))
 
     def test_river_crossing_blocked(self):
         """Verify that a Potomac or Anacostia river crossing is correctly identified as blocked."""
         # Across Potomac
-        self.assertTrue(engine.crosses_river(38.990, -77.160, 38.990, -77.120))
+        self.assertTrue(utils.crosses_river(38.990, -77.160, 38.990, -77.120))
         # Across Anacostia
-        self.assertTrue(engine.crosses_river(38.900, -76.980, 38.900, -76.950))
+        self.assertTrue(utils.crosses_river(38.900, -76.980, 38.900, -76.950))
 
     def test_crosses_river_false(self):
         """Verify that crosses_river returns False for coordinates not crossing any barriers."""
         # Safe path: (38.900, -77.030) to (38.901, -77.030) (both in DC downtown)
-        self.assertFalse(engine.crosses_river(38.900, -77.030, 38.901, -77.030))
+        self.assertFalse(utils.crosses_river(38.900, -77.030, 38.901, -77.030))
 
     def test_smooth_floor(self):
         """Verify that smooth_floor outputs values >= 0.01 and matches expected behavior."""
         # For high x (e.g. 1.0), smooth_floor should return x
-        self.assertAlmostEqual(engine.smooth_floor(1.0), 1.0, places=4)
+        self.assertAlmostEqual(utils.smooth_floor(1.0), 1.0, places=4)
         # For x = 0, smooth_floor should return math.log(2)/100 = 0.00693...
         # Wait, smooth_floor(0.0) is log(2)/100 which is ~0.0069, but when clipped >= 0.01 is enforced by caller
-        self.assertLess(engine.smooth_floor(0.0), 0.01)
-        self.assertGreater(engine.smooth_floor(0.0), 0.0)
+        self.assertLess(utils.smooth_floor(0.0), 0.01)
+        self.assertGreater(utils.smooth_floor(0.0), 0.0)
         
         # Test numpy array version
         arr = np.array([0.0, 1.0])
-        res = engine.smooth_floor(arr)
+        res = utils.smooth_floor(arr)
         self.assertAlmostEqual(res[1], 1.0, places=4)
         self.assertLess(res[0], 0.01)
+
+    def test_validate_coordinates(self):
+        """Verify that validate_coordinates checks coordinates against DMV bounds correctly."""
+        # Inside bounds
+        self.assertTrue(utils.validate_coordinates(38.9072, -77.0369)) # DC Center
+        self.assertTrue(utils.validate_coordinates(38.5, -77.5))
+        self.assertTrue(utils.validate_coordinates(39.5, -76.5))
+        self.assertTrue(utils.validate_coordinates(38.0, -78.0))
+        self.assertTrue(utils.validate_coordinates(40.0, -76.0))
+        
+        # Out of bounds
+        self.assertFalse(utils.validate_coordinates(0.0, 0.0))
+        self.assertFalse(utils.validate_coordinates(37.9, -77.0))
+        self.assertFalse(utils.validate_coordinates(40.1, -77.0))
+        self.assertFalse(utils.validate_coordinates(39.0, -78.1))
+        self.assertFalse(utils.validate_coordinates(39.0, -75.9))
+
+        # Robustness checks for invalid types, None, lists, dicts, NaN, Inf
+        self.assertFalse(utils.validate_coordinates("not-a-float", -77.0))
+        self.assertFalse(utils.validate_coordinates(None, -77.0))
+        self.assertFalse(utils.validate_coordinates([38.9], -77.0))
+        self.assertFalse(utils.validate_coordinates({"lat": 38.9}, -77.0))
+        self.assertFalse(utils.validate_coordinates(float('nan'), -77.0))
+        self.assertFalse(utils.validate_coordinates(38.9, float('inf')))
+        self.assertFalse(utils.validate_coordinates(True, -77.0))
+        self.assertTrue(utils.validate_coordinates("38.9", "-77.0"))
+
+    def test_smooth_floor_list_tuple(self):
+        """Verify that smooth_floor handles lists and tuples by converting them to numpy arrays."""
+        res_list = utils.smooth_floor([0.0, 1.0])
+        self.assertIsInstance(res_list, np.ndarray)
+        self.assertAlmostEqual(res_list[1], 1.0, places=4)
+        self.assertLess(res_list[0], 0.01)
+
+        res_tuple = utils.smooth_floor((0.0, 1.0))
+        self.assertIsInstance(res_tuple, np.ndarray)
+        self.assertAlmostEqual(res_tuple[1], 1.0, places=4)
+        self.assertLess(res_tuple[0], 0.01)
 
     def test_spectral_analysis_adaptive(self):
         """Verify that spectral_analysis accepts adaptive regularisation parameter and v0."""
@@ -1125,6 +1165,710 @@ class TestOptimizedEngineAdditional(unittest.TestCase):
             "shape_id": engine.state.get('trip_to_shape', {}).get("mock_trip_123")
         }
         self.assertEqual(wmata_bus["shape_id"], "mock_shape_abc")
+
+
+class MockWfile:
+    def __init__(self):
+        self.data = b""
+    def write(self, data):
+        self.data += data
+
+class MockHandler(server.Handler):
+    def __init__(self):
+        self.path = ""
+        self.headers = {}
+        self.wfile = MockWfile()
+        self.rfile = Mock()
+        self.client_address = ("127.0.0.1", 12345)
+        self.response_code = None
+        self.headers_sent = {}
+
+    def send_response(self, code):
+        self.response_code = code
+
+    def send_header(self, name, val):
+        self.headers_sent[name] = val
+
+    def end_headers(self):
+        pass
+
+
+class TestServerEndpoints(unittest.TestCase):
+    def test_api_route_validation_missing(self):
+        """Verify server /api/route returns 400 when coordinates are missing."""
+        handler = Mock(spec=server.Handler)
+        handler.path = '/api/route'
+        handler.headers = {'Content-Length': '2'}
+        handler.rfile = Mock()
+        handler.rfile.read.return_value = b"{}"
+        
+        handler.wfile = MockWfile()
+        response_code = None
+        def send_response(code):
+            nonlocal response_code
+            response_code = code
+        handler.send_response = send_response
+        
+        server.Handler.do_POST(handler)
+        
+        self.assertEqual(response_code, 400)
+        resp_data = json.loads(handler.wfile.data.decode('utf-8'))
+        self.assertEqual(resp_data["status"], "error")
+        self.assertIn("Missing coordinates", resp_data["message"])
+
+    def test_api_route_validation_malformed(self):
+        """Verify server /api/route returns 400 when parameters are malformed (not float convertible)."""
+        handler = Mock(spec=server.Handler)
+        handler.path = '/api/route'
+        payload = {"start_lat": "abc", "start_lon": -77.0, "end_lat": 38.9, "end_lon": -77.0}
+        payload_bytes = json.dumps(payload).encode('utf-8')
+        handler.headers = {'Content-Length': str(len(payload_bytes))}
+        handler.rfile = Mock()
+        handler.rfile.read.return_value = payload_bytes
+        
+        handler.wfile = MockWfile()
+        response_code = None
+        def send_response(code):
+            nonlocal response_code
+            response_code = code
+        handler.send_response = send_response
+        
+        server.Handler.do_POST(handler)
+        
+        self.assertEqual(response_code, 400)
+        resp_data = json.loads(handler.wfile.data.decode('utf-8'))
+        self.assertEqual(resp_data["status"], "error")
+        self.assertIn("Malformed coordinate parameters", resp_data["message"])
+
+    def test_api_route_validation_out_of_bounds(self):
+        """Verify server /api/route returns 400 when coordinates lie outside the DMV bounding box."""
+        handler = Mock(spec=server.Handler)
+        handler.path = '/api/route'
+        payload = {"start_lat": 0.0, "start_lon": 0.0, "end_lat": 38.9, "end_lon": -77.0}
+        payload_bytes = json.dumps(payload).encode('utf-8')
+        handler.headers = {'Content-Length': str(len(payload_bytes))}
+        handler.rfile = Mock()
+        handler.rfile.read.return_value = payload_bytes
+        
+        handler.wfile = MockWfile()
+        response_code = None
+        def send_response(code):
+            nonlocal response_code
+            response_code = code
+        handler.send_response = send_response
+        
+        server.Handler.do_POST(handler)
+        
+        self.assertEqual(response_code, 400)
+        resp_data = json.loads(handler.wfile.data.decode('utf-8'))
+        self.assertEqual(resp_data["status"], "error")
+        self.assertIn("Coordinates out of DMV bounds", resp_data["message"])
+
+    def test_api_route_invalid_json(self):
+        """Verify server /api/route returns 400 when JSON body is malformed or invalid."""
+        handler = MockHandler()
+        handler.path = '/api/route'
+        payload_bytes = b"{invalid-json"
+        handler.headers = {'Content-Length': str(len(payload_bytes))}
+        handler.rfile.read.return_value = payload_bytes
+        
+        handler.do_POST()
+        
+        self.assertEqual(handler.response_code, 400)
+        resp_data = json.loads(handler.wfile.data.decode('utf-8'))
+        self.assertEqual(resp_data["status"], "error")
+        self.assertEqual(resp_data["message"], "Invalid JSON payload")
+
+    def test_api_key_auth_missing_header(self):
+        """Verify API endpoints require authentication and reject without headers."""
+        handler = MockHandler()
+        handler.path = '/api/inject'
+        handler.headers = {} # No Authorization header
+        
+        with patch.dict(os.environ, {"XRAY_API_KEY": "secret_key"}):
+            handler.do_POST()
+            self.assertEqual(handler.response_code, 401)
+            resp_data = json.loads(handler.wfile.data.decode('utf-8'))
+            self.assertEqual(resp_data["status"], "error")
+            self.assertEqual(resp_data["message"], "Unauthorized")
+
+    def test_api_key_auth_no_env_variable(self):
+        """Verify that authentication fails if the XRAY_API_KEY env var is not set."""
+        handler = MockHandler()
+        handler.path = '/api/inject'
+        handler.headers = {"Authorization": "Bearer secret_key"}
+        
+        with patch.dict(os.environ, {}, clear=True):
+            if "XRAY_API_KEY" in os.environ:
+                del os.environ["XRAY_API_KEY"]
+            handler.do_POST()
+            self.assertEqual(handler.response_code, 401)
+
+    def test_api_key_auth_success(self):
+        """Verify authorized request with valid Bearer token."""
+        handler = MockHandler()
+        handler.path = '/api/inject'
+        payload = {"node_id": "wmata_1001"}
+        payload_bytes = json.dumps(payload).encode('utf-8')
+        handler.headers = {
+            "Authorization": "Bearer secret_key",
+            "Content-Length": str(len(payload_bytes))
+        }
+        handler.rfile.read.return_value = payload_bytes
+        
+        with patch.dict(os.environ, {"XRAY_API_KEY": "secret_key"}):
+            with patch("server._sim_lock"):  # Mock lock to avoid file side effects
+                handler.do_POST()
+                self.assertEqual(handler.response_code, 200)
+
+    def test_get_whitelisted_paths(self):
+        """Verify whitelisted paths are allowed and rewritten properly."""
+        for path in ["/", "/index.html", "/buses.html", "/trains.html"]:
+            handler = MockHandler()
+            handler.path = path
+            
+            with patch('http.server.SimpleHTTPRequestHandler.do_GET') as mock_super_get:
+                handler.do_GET()
+                if path == "/":
+                    self.assertTrue(handler.path.startswith("/index.html"))
+                mock_super_get.assert_called_once()
+                self.assertNotEqual(handler.response_code, 404)
+
+    def test_get_traversal_paths_blocked(self):
+        """Verify traversal paths and unwhitelisted paths are returned 404."""
+        bad_paths = [
+            "/static/../../etc/passwd",
+            "/buses.html/..",
+            "/invalid_file.html",
+            "/static/nonexistent_file.json", # static checks if file is on disk
+            "/path\\with\\backslash"
+        ]
+        for path in bad_paths:
+            handler = MockHandler()
+            handler.path = path
+            
+            with patch('http.server.SimpleHTTPRequestHandler.do_GET') as mock_super_get:
+                handler.do_GET()
+                self.assertEqual(handler.response_code, 404)
+                mock_super_get.assert_not_called()
+
+    def test_favicon_fallback_png(self):
+        """Verify favicon serves custom 1x1 transparent PNG fallback if file doesn't exist."""
+        handler = MockHandler()
+        handler.path = "/favicon.ico"
+        
+        with patch('os.path.exists', return_value=False):
+            handler.do_GET()
+            self.assertEqual(handler.response_code, 200)
+            self.assertEqual(handler.headers_sent.get("Content-Type"), "image/x-icon")
+            self.assertIn(b"PNG", handler.wfile.data)
+
+    def test_api_rate_limiting_blocking(self):
+        """Verify rate limit blocks the 11th request within 60 seconds and returns 429."""
+        # Reset rate limiting state
+        server._rate_limit_history.clear()
+        
+        ip = "192.168.1.50"
+        # Simulate 10 successful check_rate_limit calls
+        for _ in range(10):
+            self.assertTrue(server.check_rate_limit(ip))
+        
+        # 11th call should return False
+        self.assertFalse(server.check_rate_limit(ip))
+        
+        # Check HTTP handler returns 429
+        handler = MockHandler()
+        handler.path = '/api/route'
+        handler.client_address = (ip, 12345)
+        
+        handler.do_POST()
+        self.assertEqual(handler.response_code, 429)
+        resp_data = json.loads(handler.wfile.data.decode('utf-8'))
+        self.assertEqual(resp_data["status"], "error")
+        self.assertEqual(resp_data["message"], "Too many requests")
+
+    def test_exception_sanitization(self):
+        """Verify exception handler sanitizes error messages and writes to log."""
+        handler = MockHandler()
+        
+        # Delete server.log if it exists to verify creation
+        if os.path.exists("server.log"):
+            try:
+                os.remove("server.log")
+            except: pass
+            
+        test_exc = ValueError("Sensitive database path or traceback detail")
+        handler.handle_error(test_exc, status_code=500, client_message="Sanitized error message")
+        
+        self.assertEqual(handler.response_code, 500)
+        resp_data = json.loads(handler.wfile.data.decode('utf-8'))
+        # Response must not contain "Sensitive database path"
+        self.assertNotIn("Sensitive database path", resp_data["message"])
+        self.assertEqual(resp_data["message"], "Sanitized error message")
+        
+        # Verify log has the detailed error
+        self.assertTrue(os.path.exists("server.log"))
+        with open("server.log", "r") as f:
+            log_content = f.read()
+            self.assertIn("Sensitive database path", log_content)
+
+
+class TestMilestone5Expansion(unittest.TestCase):
+    def get_clean_state(self):
+        return {
+            "weather_penalty": 1.0,
+            "weather_desc": "Clear",
+            "precipitation_rate": 0.0,
+            "history_bikes": {},
+            "history_distances": {},
+            "weather_ema": {"V": 14.5, "P": 0.0, "VP": 0.0, "P2": 0.0},
+            "incidents": {"dc": [], "md": [], "va": []},
+            "injections": [], 
+            "bikeshare": {"total_bikes": 0, "active_stations": 0, "depleted_stations": 0, "depleted_node_indices": [], "node_to_metadata": {}},
+            "gtfs_delays": {},
+            "trip_delays": {},
+            "trip_to_shape": {},
+            "live_speeds": {},
+            "live_speeds_list": {},
+            "live_buses": {},
+            "predictive_friction": {},
+            "wmata_official_alerts": set(), 
+            "rail_alerts": 0,
+            "rail_surges": set(),
+            "canary_buses": {},
+            "active_predictions": {},
+            "bus_positions": [],
+            "bus_positions_dict": {},
+            "train_positions": [],
+            "prev_trains": {},
+            "scoreboard_stats": {"xray_wins": 0, "wmata_wins": 0, "avg_lead_time_sec": 0.0, "total_races": 0},
+            "last_payload_ts": 0,
+            "engine_start": time.time(),
+            "total_cycles": 0,
+            "graph_stats": {
+                "avg_friction": 1.0, "spectral_gap": 0.0, "active_nodes": 0, "active_edges": 0,
+                "system_tension": 0.0, "total_delay_sec": 0, "compute_latency": 0.0,
+                "peak_latency": 0.0, "fiedler_max": 0.0, "fiedler_pole_name": "Core",
+                "worst_node_name": "None", "centrality": [], "active_alerts": 0 
+            }
+        }
+
+    def test_heat_kernel_diffusion(self):
+        # 1. Setup a simple circular graph with 5 nodes
+        nodes_list = ["node0", "node1", "node2", "node3", "node4"]
+        node_to_idx = {n: i for i, n in enumerate(nodes_list)}
+        stops_info = {n: {"name": f"Stop {n}", "lat": 38.9 + i*0.01, "lon": -77.0 + i*0.01} for i, n in enumerate(nodes_list)}
+        
+        # Circular adjacency: 0-1, 1-2, 2-3, 3-4, 4-0
+        row_idx = np.array([0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+        col_idx = np.array([1, 4, 0, 2, 1, 3, 2, 4, 3, 0])
+        data = np.ones(10, dtype=np.float32)
+        W_mask = sp.csr_matrix((data, (row_idx, col_idx)), shape=(5, 5))
+        
+        # D_inv
+        D_diag = np.array(W_mask.sum(axis=1)).flatten()
+        D_inv = 1.0 / D_diag
+        
+        # Setup state
+        test_state = self.get_clean_state()
+        test_state.update({
+            "weather_penalty": 1.2,
+            "rail_alerts": 1,
+            "rail_surges": {2}
+        })
+        surge_hubs_idx = [0]
+        
+        # Let's compute the expected initial f value BEFORE diffusion:
+        f_init = np.ones(len(nodes_list), dtype=np.float32) * test_state['weather_penalty']
+        # tau noise
+        tau_noise = 1e-5 * np.sin(math.tau * np.arange(len(nodes_list)) / len(nodes_list))
+        f_init += tau_noise
+        
+        # apply rail alerts penalty (idx 0 -> surge hub)
+        f_init[0] *= 0.7
+        # apply rail surge penalty (idx 2 -> rail surge)
+        f_init[2] *= 0.6
+        
+        # Manual diffusion calculation
+        D_inv_W_f = D_inv * (W_mask @ f_init)
+        f_expected = (1.0 - engine.ALPHA_DIFFUSION) * f_init + engine.ALPHA_DIFFUSION * D_inv_W_f
+        # apply smooth_floor and clip
+        f_expected = np.clip(utils.smooth_floor(f_expected), 0.01, 1.0)
+        
+        # Call compute_friction_field
+        f_actual, _, _, _, _, _ = engine.compute_friction_field(
+            test_state,
+            W_mask,
+            nodes_list,
+            node_to_idx,
+            stops_info,
+            surge_hubs_idx,
+            D_inv,
+            last_f=None,
+            last_l2=0.05,
+            last_v2=None,
+            last_gap=0.05,
+            loop_start=time.time()
+        )
+        
+        np.testing.assert_allclose(f_actual, f_expected, rtol=1e-5)
+
+    @patch("engine.eigsh")
+    def test_fiedler_vector_warm_starting(self, mock_eigsh):
+        mock_evals = np.array([0.1, 0.2, 0.3])
+        mock_evecs = np.zeros((5, 3))
+        mock_evecs[:, 1] = np.array([0.1, -0.2, 0.3, -0.4, 0.2])
+        mock_eigsh.return_value = (mock_evals, mock_evecs)
+        
+        nodes_list = ["node0", "node1", "node2", "node3", "node4"]
+        node_to_idx = {n: i for i, n in enumerate(nodes_list)}
+        stops_info = {n: {"name": f"Stop {n}", "lat": 38.9, "lon": -77.0} for n in nodes_list}
+        
+        row_idx = np.array([0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+        col_idx = np.array([1, 4, 0, 2, 1, 3, 2, 4, 3, 0])
+        data = np.ones(10, dtype=np.float32)
+        W_mask = sp.csr_matrix((data, (row_idx, col_idx)), shape=(5, 5))
+        
+        D_diag = np.array(W_mask.sum(axis=1)).flatten()
+        D_inv = 1.0 / D_diag
+        
+        test_state = self.get_clean_state()
+        
+        last_v2 = np.array([0.5, -0.5, 0.0, 0.5, -0.5], dtype=np.float64)
+        
+        f, W_weighted, l2, v2, gap, lat = engine.compute_friction_field(
+            test_state,
+            W_mask,
+            nodes_list,
+            node_to_idx,
+            stops_info,
+            surge_hubs_idx=[],
+            D_inv=D_inv,
+            last_f=np.zeros(5),
+            last_l2=0.05,
+            last_v2=last_v2,
+            last_gap=0.05,
+            loop_start=time.time()
+        )
+        
+        mock_eigsh.assert_called()
+        args, kwargs = mock_eigsh.call_args
+        self.assertIn("v0", kwargs)
+        np.testing.assert_array_equal(kwargs["v0"], last_v2)
+
+    @patch("engine.eigsh")
+    def test_spectral_solver_gating_logic(self, mock_eigsh):
+        # 1. n <= 3 fallback using scipy.linalg.eigh
+        W_small = sp.csr_matrix([[0.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 0.0]])
+        f_small = np.array([1.0, 1.0, 1.0])
+        
+        l2_3, v2_3, gap_3 = engine.spectral_analysis(W_small, f=f_small)
+        
+        self.assertAlmostEqual(l2_3, 3.0)
+        self.assertEqual(len(v2_3), 3)
+        self.assertAlmostEqual(gap_3, 0.0)
+        mock_eigsh.assert_not_called()
+        
+        # 2. n > 3 and eigsh raises ArpackNoConvergence on both attempts
+        mock_eigsh.reset_mock()
+        from scipy.sparse.linalg import ArpackNoConvergence
+        mock_eigsh.side_effect = ArpackNoConvergence("LM fail", eigenvalues=np.array([0.1]), eigenvectors=np.zeros((4, 1)))
+        
+        W_large = sp.csr_matrix([
+            [0.0, 1.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0, 0.0]
+        ])
+        f_large = np.array([1.0, 1.0, 1.0, 1.0])
+        
+        l2_fail, v2_fail, gap_fail = engine.spectral_analysis(W_large, f=f_large)
+        
+        self.assertEqual(l2_fail, 0.0)
+        np.testing.assert_array_equal(v2_fail, np.zeros(4))
+        self.assertEqual(gap_fail, 0.0)
+        self.assertEqual(mock_eigsh.call_count, 2)
+        
+        first_call_kwargs = mock_eigsh.call_args_list[0][1]
+        second_call_kwargs = mock_eigsh.call_args_list[1][1]
+        
+        self.assertEqual(first_call_kwargs.get("which"), "LM")
+        self.assertEqual(second_call_kwargs.get("which"), "SM")
+
+        # 3. n > 3 and eigsh raises ValueError on fallback
+        mock_eigsh.reset_mock()
+        mock_eigsh.side_effect = [
+            ArpackNoConvergence("LM fail", eigenvalues=None, eigenvectors=None),
+            ValueError("SM ValueError")
+        ]
+        
+        l2_val, v2_val, gap_val = engine.spectral_analysis(W_large, f=f_large)
+        self.assertEqual(l2_val, 0.0)
+        np.testing.assert_array_equal(v2_val, np.zeros(4))
+        self.assertEqual(gap_val, 0.0)
+
+    def test_multimodal_metrics(self):
+        orig_cwd = os.getcwd()
+        tmp_dir = tempfile.mkdtemp()
+        os.chdir(tmp_dir)
+        try:
+            os.makedirs("static/history", exist_ok=True)
+            nodes_list = ["node0", "node1"]
+            node_to_idx = {"node0": 0, "node1": 1}
+            stops_info = {
+                "node0": {"name": "Stop 0", "lat": 38.90, "lon": -77.03},
+                "node1": {"name": "Stop 1", "lat": 38.91, "lon": -77.03}
+            }
+            route_to_stops = {"route0": ["node0", "node1"]}
+            
+            W = sp.csr_matrix([[0.0, 1.0], [1.0, 0.0]])
+            W_mask = W.copy()
+            W_mask.data[:] = 1.0
+            
+            f = np.array([0.5, 0.9], dtype=np.float32)
+            v2 = np.array([0.1, -0.1])
+            l2 = 0.05
+            gap = 0.05
+            thresholds = np.array([0.4, 0.4])
+            rows = np.array([0, 1])
+            
+            test_state = self.get_clean_state()
+            test_state.update({
+                "total_cycles": 1,
+                "weather_penalty": 1.0,
+                "weather_desc": "Clear",
+                "precipitation_rate": 0.5,
+                "weather_ema": {"V": 15.0, "P": 0.2, "VP": 3.0, "P2": 0.04},
+                "incidents": {"dc": [0], "md": [], "va": []},
+                "history_distances": {0: 100.0},
+                "bikeshare": {
+                    "total_bikes": 10,
+                    "active_stations": 2,
+                    "depleted_stations": 1,
+                    "depleted_node_indices": [0],
+                    "node_to_metadata": {0: {"name": "Bikeshare 0", "bikes": 0, "capacity": 10, "docks": 10}}
+                },
+                "gtfs_delays": {"node0": 100.0},
+                "live_speeds": {"node0": 10.0},
+                "live_speeds_list": {"node0": [10.0]},
+                "wmata_official_alerts": {"route0"},
+                "rail_alerts": 1,
+                "scoreboard_stats": {"xray_wins": 5, "wmata_wins": 2, "avg_lead_time_sec": 120.0, "total_races": 7},
+            })
+            test_state["graph_stats"].update({
+                "avg_friction": 0.7, "spectral_gap": 0.05, "active_nodes": 2, "active_edges": 1,
+                "system_tension": 0.2, "total_delay_sec": 0, "compute_latency": 1.5,
+                "peak_latency": 2.0, "fiedler_max": 0.1, "fiedler_pole_name": "Stop 0",
+                "worst_node_name": "Stop 0", "centrality": [1.0, 1.0], "active_alerts": 1
+            })
+            
+            engine.export_visualization_data(
+                test_state,
+                v2,
+                l2,
+                gap,
+                f,
+                W,
+                nodes_list,
+                stops_info,
+                route_to_stops,
+                node_to_idx,
+                thresholds,
+                rows,
+                W_mask
+            )
+            
+            self.assertTrue(os.path.exists("static/live_data.json"))
+            self.assertTrue(os.path.exists("static/manifest.json"))
+            self.assertTrue(os.path.exists("static/history/frame_1.json"))
+            
+            with open("static/live_data.json", "r") as f_json:
+                data = json.load(f_json)
+                
+            metrics = data["metrics"]
+            self.assertAlmostEqual(metrics["panic_shift"], 31.0)
+            self.assertAlmostEqual(metrics["wavefront_velocity"], 0.0)
+            self.assertAlmostEqual(metrics["gridlock_split"], 50.0)
+            self.assertAlmostEqual(metrics["ops_split"], 50.0)
+            self.assertAlmostEqual(metrics["weather_drag"], 5.0)
+            
+        finally:
+            os.chdir(orig_cwd)
+            shutil.rmtree(tmp_dir)
+
+    def test_canary_protocol_adjudication(self):
+        orig_cwd = os.getcwd()
+        tmp_dir = tempfile.mkdtemp()
+        os.chdir(tmp_dir)
+        try:
+            nodes_list = ["node0", "node1"]
+            stops_info = {
+                "node0": {"name": "Stop 0", "lat": 38.90, "lon": -77.03},
+                "node1": {"name": "Stop 1", "lat": 38.91, "lon": -77.03}
+            }
+            route_to_stops = {"route0": ["node0", "node1"]}
+            
+            W_weighted = sp.csr_matrix(([0.1, 0.1], ([0, 1], [1, 0])), shape=(2, 2))
+            thresholds = np.array([0.4, 0.4])
+            rows = np.array([0, 1])
+            
+            test_state = self.get_clean_state()
+            test_state.update({
+                "live_buses": {"route0": ["bus_canary_1"]},
+                "scoreboard_stats": {"xray_wins": 0, "wmata_wins": 0, "total_races": 0, "avg_lead_time_sec": 0.0}
+            })
+            
+            t_before = time.time()
+            fractures = engine.detect_fractures(
+                test_state, W_weighted, thresholds, rows, nodes_list, stops_info, route_to_stops
+            )
+            t_after = time.time()
+            
+            self.assertEqual(len(fractures), 1)
+            self.assertEqual(fractures[0]["u"], "Stop 0")
+            
+            self.assertIn("bus_canary_1", test_state["canary_buses"])
+            canary = test_state["canary_buses"]["bus_canary_1"]
+            self.assertEqual(canary["route_id"], "route0")
+            self.assertEqual(canary["target"], "Stop 0")
+            self.assertEqual(canary["status"], "Acquiring Target...")
+            
+            self.assertIn("route0", test_state["active_predictions"])
+            pred = test_state["active_predictions"]["route0"]
+            self.assertGreaterEqual(pred["t_engine"], t_before)
+            self.assertLessEqual(pred["t_engine"], t_after)
+            self.assertIsNone(pred["t_physical"])
+            self.assertIsNone(pred["t_wmata"])
+            self.assertEqual(pred["resolved"], False)
+            self.assertEqual(pred["pre_existing"], False)
+            
+            t_engine = pred["t_engine"]
+            pred["t_physical"] = t_engine + 10.0
+            pred["t_wmata"] = t_engine + 100.0
+            
+            engine.adjudicate_predictions(test_state, current_time=time.time())
+            
+            self.assertEqual(pred["resolved"], True)
+            self.assertEqual(test_state["scoreboard_stats"]["xray_wins"], 1)
+            self.assertEqual(test_state["scoreboard_stats"]["wmata_wins"], 0)
+            self.assertEqual(test_state["scoreboard_stats"]["total_races"], 1)
+            self.assertAlmostEqual(test_state["scoreboard_stats"]["avg_lead_time_sec"], 100.0)
+            
+            self.assertNotIn("bus_canary_1", test_state["canary_buses"])
+            self.assertNotIn("route0", test_state["active_predictions"])
+            
+            test_state["canary_buses"] = {}
+            test_state["active_predictions"] = {
+                "route1": {
+                    "t_engine": 1000.0,
+                    "t_physical": 1010.0,
+                    "t_wmata": 1030.0,
+                    "cause": "test tie",
+                    "resolved": False,
+                    "pre_existing": False
+                }
+            }
+            test_state["canary_buses"]["bus_canary_2"] = {"route_id": "route1"}
+            
+            pred1 = test_state["active_predictions"]["route1"]
+            engine.adjudicate_predictions(test_state, current_time=time.time())
+            self.assertTrue(pred1["resolved"])
+            self.assertEqual(test_state["scoreboard_stats"]["xray_wins"], 1)
+            self.assertEqual(test_state["scoreboard_stats"]["wmata_wins"], 0)
+            self.assertEqual(test_state["scoreboard_stats"]["total_races"], 2)
+            self.assertAlmostEqual(test_state["scoreboard_stats"]["avg_lead_time_sec"], 65.0)
+            
+            test_state["active_predictions"] = {
+                "route2": {
+                    "t_engine": 1000.0,
+                    "t_physical": 1010.0,
+                    "t_wmata": 900.0,
+                    "cause": "test wmata",
+                    "resolved": False,
+                    "pre_existing": False
+                }
+            }
+            pred2 = test_state["active_predictions"]["route2"]
+            engine.adjudicate_predictions(test_state, current_time=time.time())
+            self.assertTrue(pred2["resolved"])
+            self.assertEqual(test_state["scoreboard_stats"]["xray_wins"], 1)
+            self.assertEqual(test_state["scoreboard_stats"]["wmata_wins"], 1)
+            self.assertEqual(test_state["scoreboard_stats"]["total_races"], 3)
+            
+        finally:
+            os.chdir(orig_cwd)
+            shutil.rmtree(tmp_dir)
+
+    def test_full_main_loop_integration(self):
+        import asyncio
+        class TerminateLoop(Exception):
+            pass
+        
+        orig_cwd = os.getcwd()
+        tmp_dir = tempfile.mkdtemp()
+        os.chdir(tmp_dir)
+        try:
+            os.makedirs("static/history", exist_ok=True)
+            
+            nodes_list = ["n0", "n1", "n2", "n3", "n4"]
+            node_to_idx = {n: i for i, n in enumerate(nodes_list)}
+            stops_info = {n: {"name": f"Stop {n}", "lat": 38.9 + i*0.01, "lon": -77.0 + i*0.01} for i, n in enumerate(nodes_list)}
+            
+            row_idx = np.array([0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+            col_idx = np.array([1, 4, 0, 2, 1, 3, 2, 4, 3, 0])
+            data = np.ones(10, dtype=np.float32)
+            W = sp.csr_matrix((data, (row_idx, col_idx)), shape=(5, 5))
+            
+            coords = np.array([[stops_info[n]["lat"], stops_info[n]["lon"]] for n in nodes_list])
+            tree = KDTree(coords)
+            route_to_stops = {"route0": nodes_list}
+            
+            engine.state.clear()
+            engine.state.update(self.get_clean_state())
+            engine.state.update({
+                "graph_stats": {
+                    "avg_friction": 1.0, "spectral_gap": 0.0, "active_nodes": 5, "active_edges": 5,
+                    "system_tension": 0.0, "total_delay_sec": 0, "compute_latency": 0.0,
+                    "peak_latency": 0.0, "fiedler_max": 0.0, "fiedler_pole_name": "Core",
+                    "worst_node_name": "None", "centrality": np.zeros(5), "active_alerts": 0 
+                }
+            })
+            
+            async def mock_sleep(delay):
+                raise TerminateLoop("Loop completed one iteration")
+                
+            with patch("asyncio.sleep", mock_sleep):
+                try:
+                    asyncio.run(engine.main_loop(W, nodes_list, node_to_idx, stops_info, tree, route_to_stops))
+                except TerminateLoop:
+                    pass
+            
+            self.assertTrue(os.path.exists("network_state.npz"))
+            self.assertTrue(os.path.exists("static/live_data.json"))
+            self.assertTrue(os.path.exists("static/manifest.json"))
+            self.assertTrue(os.path.exists("static/history/frame_1.json"))
+            
+            with open("static/live_data.json", "r") as f_json:
+                live_data = json.load(f_json)
+                
+            expected_keys = ["timestamp", "cycle", "metrics", "gx", "gy", "gz", "wx1", "wy1", "wz1", "wx2", "wy2", "wz2",
+                             "fx", "fy", "fz", "cx", "cy", "cz", "ctxt", "jx", "jy", "jz", "jtxt", "jsiz", "jcol",
+                             "bx", "by", "bz", "btxt", "routes", "buses", "trains", "bisection"]
+            for key in expected_keys:
+                self.assertIn(key, live_data)
+                
+            metrics_expected_keys = ["l2", "gap", "weather", "penalty", "dc", "md", "va", "bike", "alerts",
+                                     "rail_alerts", "xray_wins", "wmata_wins", "avg_lead", "panic_shift",
+                                     "wavefront_velocity", "gridlock_split", "ops_split", "weather_drag"]
+            for key in metrics_expected_keys:
+                self.assertIn(key, live_data["metrics"])
+                
+            self.assertEqual(live_data["cycle"], 1)
+            
+        finally:
+            os.chdir(orig_cwd)
+            shutil.rmtree(tmp_dir)
+
 
 if __name__ == "__main__":
     unittest.main()

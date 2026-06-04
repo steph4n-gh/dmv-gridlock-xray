@@ -55,6 +55,26 @@ Every 30 seconds, the engine builds a dynamic Graph Laplacian from live transit,
 
 ---
 
+## 🛰️ Streamlit 3D Topological Terrain Visualizer
+
+The Streamlit application (`viz.py`) provides an interactive, diagnostic-heavy 3D visualization dashboard of the transit network's spectral topology. It interfaces directly with the processing engine via `network_state.npz` and `sim_state.json` using atomic cross-process file locks.
+
+### Features
+*   **3D Spectral Neural Web**: Renders the complete, live transit topology. Edge weights are color-coded, and node heights ($z_i$) are scaled by their Fiedler vector coordinates ($z_i = 150 \cdot v_{2,i}$), visually projecting structural isolation as peaks rising from the ground plane.
+*   **Interactive Simulation Lab**: Allows dispatchers to simulate localized network failures. Users can select any stop node from a dropdown and click **Inject Critical Failure** to clamp that stop's friction score to $0.05$ (writing atomically to `sim_state.json`). Clicking **Clear Simulations** restores normal tracking.
+*   **Live System Diagnostics Panel**: Displays live telemetry in the sidebar, including:
+    *   **λ2 Health (Fiedler Value)**: Measures systemic cohesion, showing real-time trends (↗️ Improving, ↘️ Degrading, ➡️ Stable).
+    *   **Regional Weather Drag**: Active precipitation reports and global friction multipliers.
+    *   **Jurisdictional Incidents**: Active incident counts in DC, MD, and VA.
+    *   **Bikeshare Depletion**: Real-time count of empty bikeshare hubs.
+    *   **Active WMATA Alerts**: Stream of official transit bulletin updates.
+*   **Rendering & View Controls**:
+    *   **Connection Density Slider**: Adjusts neural web lines from 0.1x to 1.0x to reduce GPU render load.
+    *   **Fracture Sensitivity Slider**: Custom threshold slider to debug edge bisection boundaries.
+    *   **Camera Angle Locking**: Employs camera coordinate persistence (`uirevision`) to preserve user rotate/pan zoom levels across automatic data refreshes.
+
+---
+
 ## 📐 Mathematical Formulation
 
 ### The Graph Laplacian
@@ -135,22 +155,32 @@ If these files are missing or incomplete, the application will automatically dow
 
 ## 🚦 Running the Application
 
-For a fully active system, you must run both the backend processing engine and the web router server concurrently.
+For a fully active system, you must run the backend processing engine, the HTTP web server, and the Streamlit 3D visualizer concurrently.
 
-### Start the Processing Engine
+### 1. Start the Processing Engine
 The engine handles real-time API scraping, Laplacian math calculations, and exports state files:
 ```bash
 # In Terminal 1 (with venv activated)
 python engine.py
 ```
 
-### Start the Web Server
+### 2. Start the Web Server
 The server hosts the HTML/WebGL dashboard interface and provides routing endpoints:
 ```bash
 # In Terminal 2 (with venv activated)
 python server.py
 ```
-Once both processes are active, navigate to **`http://localhost:8501`** in your browser.
+Once active, navigate to **`http://localhost:8501`** in your browser to view the client-side WebGL dashboard.
+
+### 3. Start the Streamlit 3D Visualizer
+To view the 3D topological terrain graph with live bisection and failure injection controls:
+```bash
+# In Terminal 3 (with venv activated)
+streamlit run viz.py --server.port 8502
+```
+Once active, navigate to **`http://localhost:8502`** in your browser.
+
+*Note: Specifying `--server.port 8502` prevents port collisions since the web server defaults to `8501`.*
 
 ---
 

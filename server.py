@@ -8,51 +8,70 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import KDTree
+import traceback
+import threading
+import posixpath
+import urllib.parse
+import hmac
+import sys
+import contextlib
 
-POTOMAC_BARRIER = [
-    ((38.995, -77.162), (38.960, -77.130)),
-    ((38.960, -77.130), (38.930, -77.115)),
-    ((38.930, -77.115), (38.900, -77.070)),
-    ((38.900, -77.070), (38.888, -77.060)),
-    ((38.888, -77.060), (38.875, -77.043)),
-    ((38.875, -77.043), (38.850, -77.040)),
-    ((38.850, -77.040), (38.790, -77.035))
-]
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
-ANACOSTIA_BARRIER = [
-    ((38.935, -76.940), (38.915, -76.955)),
-    ((38.915, -76.955), (38.900, -76.965)),
-    ((38.900, -76.965), (38.875, -76.980)),
-    ((38.875, -76.980), (38.860, -77.010)),
-    ((38.860, -77.010), (38.858, -77.025))
-]
+@contextlib.contextmanager
+def file_lock(lock_file_path, exclusive=True):
+    if fcntl is None:
+        yield
+        return
+    lock_file = None
+    try:
+        lock_file = open(lock_file_path, "w")
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(lock_file, mode)
+        yield
+    finally:
+        if lock_file is not None:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_file.close()
 
-def ccw(A, B, C):
-    return (C[0] - A[0]) * (B[1] - A[1]) > (B[0] - A[0]) * (C[1] - A[1])
+from utils import POTOMAC_BARRIER, ANACOSTIA_BARRIER, ccw, segments_intersect, crosses_river, smooth_floor, validate_coordinates
 
-def segments_intersect(A, B, C, D):
-    return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+# Concurrency and Rate Limiting State
+_cache_lock = threading.Lock()
+_sim_lock = threading.Lock()
+_rate_limit_lock = threading.Lock()
+_rate_limit_history = {}
+_rate_limit_request_counter = 0
 
-def crosses_river(lat1, lon1, lat2, lon2):
-    p1 = (lat1, lon1)
-    p2 = (lat2, lon2)
-    for seg in POTOMAC_BARRIER:
-        if segments_intersect(p1, p2, seg[0], seg[1]):
-            return True
-    for seg in ANACOSTIA_BARRIER:
-        if segments_intersect(p1, p2, seg[0], seg[1]):
-            return True
-    return False
-
-def smooth_floor(x, k=100.0):
-    if isinstance(x, np.ndarray):
-        kx = k * x
-        return np.where(kx > 50.0, x, np.log1p(np.exp(np.clip(kx, -50.0, 50.0))) / k)
-    else:
-        kx = k * x
-        if kx > 50.0:
-            return x
-        return math.log1p(math.exp(kx)) / k
+def check_rate_limit(ip):
+    """Enforce a limit of 10 requests per rolling minute (60.0s) per IP."""
+    global _rate_limit_request_counter
+    now = time.time()
+    with _rate_limit_lock:
+        _rate_limit_request_counter += 1
+        cutoff = now - 60.0
+        if _rate_limit_request_counter % 100 == 0:
+            for k in list(_rate_limit_history.keys()):
+                history_k = _rate_limit_history[k]
+                filtered_k = [t for t in history_k if t > cutoff]
+                if not filtered_k:
+                    del _rate_limit_history[k]
+                else:
+                    _rate_limit_history[k] = filtered_k
+        history = _rate_limit_history.get(ip, [])
+        history = [t for t in history if t > cutoff]
+        if len(history) >= 10:
+            _rate_limit_history[ip] = history
+            return False
+        history.append(now)
+        _rate_limit_history[ip] = history
+        return True
 
 PORT = 8501
 DIRECTORY = "."
@@ -111,7 +130,16 @@ def load_and_augment_graph():
     mtime = max(os.path.getmtime(path), os.path.getmtime(tunnels_path))
     if _cache["mtime"] == mtime:
         return _cache
-    
+        
+    with _cache_lock:
+        mtime = max(os.path.getmtime(path), os.path.getmtime(tunnels_path))
+        if _cache["mtime"] == mtime:
+            return _cache
+        return _load_and_augment_graph_unlocked(mtime)
+
+def _load_and_augment_graph_unlocked(mtime):
+    path = "network_state.npz"
+    tunnels_path = "static/metro_tunnels.json"
     # Load base network state
     data = np.load(path, allow_pickle=True)
     nodes = data['nodes']
@@ -264,7 +292,8 @@ def load_and_augment_graph():
     aug_cost_matrix = sp.csr_matrix((edges_cost, (edges_from, edges_to)), shape=(aug_num_nodes, aug_num_nodes))
     aug_clear_cost_matrix = sp.csr_matrix((clear_edges_cost, (edges_from, edges_to)), shape=(aug_num_nodes, aug_num_nodes))
     
-    _cache.update({
+    global _cache
+    new_cache = {
         "mtime": mtime,
         "nodes": nodes,
         "coords": coords,
@@ -282,8 +311,247 @@ def load_and_augment_graph():
         "partitions": partitions if partitions is not None else np.zeros(N_street, dtype=np.int32),
         "centrality": centrality if centrality is not None else np.zeros(N_street),
         "lambda_2": lambda_2
-    })
+    }
+    _cache = new_cache
     return _cache
+
+def _compute_route(graph, start_idx, end_idx, is_bridge=False):
+    """
+    Shared Dijkstra computation, path reconstruction, directions building, and modes breakdown.
+    Returns a dict on success:
+    {
+        "route": route_points,
+        "telemetry": telemetry_dict,
+        "directions": directions_list
+    }
+    Or raises ValueError on error (e.g. if path is not found).
+    """
+    # Dijkstra Stressed Cost Routing
+    dist_matrix, predecessors = dijkstra(
+        graph["aug_cost_matrix"],
+        directed=False,
+        indices=start_idx,
+        return_predecessors=True
+    )
+    
+    if dist_matrix[end_idx] == np.inf:
+        if is_bridge:
+            raise ValueError("No routing path found between Snapped Hubs")
+        else:
+            raise ValueError("No path found between selected coordinates.")
+    
+    # Path reconstruction
+    path = []
+    curr = end_idx
+    while curr != start_idx and curr >= 0:
+        path.append(curr)
+        curr = predecessors[curr]
+    if curr == start_idx:
+        path.append(start_idx)
+        path.reverse()
+    else:
+        if is_bridge:
+            raise ValueError("Path reconstruction failed.")
+        else:
+            raise ValueError("Reconstruction failed.")
+            
+    # Baseline Clear Dijkstra
+    clear_dist_matrix, clear_predecessors = dijkstra(
+        graph["aug_clear_cost_matrix"],
+        directed=False,
+        indices=start_idx,
+        return_predecessors=True
+    )
+    
+    clear_path = []
+    curr_c = end_idx
+    while curr_c != start_idx and curr_c >= 0:
+        clear_path.append(curr_c)
+        curr_c = clear_predecessors[curr_c]
+    if curr_c == start_idx:
+        clear_path.append(start_idx)
+        clear_path.reverse()
+        
+    friction_time_sec = float(dist_matrix[end_idx])
+    baseline_time_sec = float(clear_dist_matrix[end_idx])
+    
+    stressed_baseline_cost = get_path_cost(clear_path, graph["aug_cost_matrix"])
+    stress_avoided_sec = max(0.0, stressed_baseline_cost - friction_time_sec)
+    
+    N_street = len(graph["nodes"])
+    num_nodes_path = len(path)
+    jammed_nodes_count = sum(1 for node in path if node < N_street and graph["node_friction"][node] < 0.5)
+    delay_exposure_pct = float((jammed_nodes_count / max(1, num_nodes_path)) * 100.0)
+    
+    route_points = []
+    directions = []
+    legs = []
+    curr_leg = None
+    
+    for idx in path:
+        mode = graph["aug_modes"][idx]
+        lat_c, lon_c = graph["aug_coords"][idx]
+        name_c = graph["aug_names"][idx]
+        
+        point_info = {
+            "lat": float(lat_c),
+            "lon": float(lon_c),
+            "name": name_c,
+            "mode": mode,
+            "node_idx": int(idx)
+        }
+        route_points.append(point_info)
+        
+        node_id = graph["nodes"][idx] if idx < N_street else ""
+        provider = "WMATA" if node_id.startswith("wmata_") else "RideOn" if node_id.startswith("rideon_") else "Rail"
+        
+        if not curr_leg:
+            curr_leg = {"mode": mode, "provider": provider, "indices": [idx]}
+        else:
+            if curr_leg["mode"] == mode and curr_leg["provider"] == provider:
+                curr_leg["indices"].append(idx)
+            else:
+                legs.append(curr_leg)
+                curr_leg = {"mode": mode, "provider": provider, "indices": [idx]}
+    if curr_leg:
+        legs.append(curr_leg)
+        
+    if is_bridge:
+        directions.append({
+            "instruction": f"ESTABLISHED EMERGENCY SHUTTLE BRIDGE between partition hubs: {graph['aug_names'][start_idx]} and {graph['aug_names'][end_idx]}.",
+            "mode": "Shuttle"
+        })
+        
+    for idx_leg, leg in enumerate(legs):
+        mode = leg["mode"]
+        provider = leg["provider"]
+        indices = leg["indices"]
+        
+        if idx_leg > 0:
+            prev_leg = legs[idx_leg-1]
+            u = prev_leg["indices"][-1]
+            v = indices[0]
+            mode_u = graph["aug_modes"][u]
+            mode_v = graph["aug_modes"][v]
+            name_u = graph["aug_names"][u]
+            name_v = graph["aug_names"][v]
+            provider_u = prev_leg["provider"]
+            provider_v = provider
+            
+            # Calculate geodesic distance
+            lat_u, lon_u = graph["aug_coords"][u]
+            lat_v, lon_v = graph["aug_coords"][v]
+            dlat = math.radians(lat_v - lat_u)
+            dlon = math.radians(lon_v - lon_u)
+            lat_mid = math.radians((lat_u + lat_v) / 2.0)
+            dist_m = math.sqrt(dlat**2 + (math.cos(lat_mid) * dlon)**2) * 6371000.0
+            
+            # Lookup transfer time
+            transfer_time_sec = lookup_cost(graph["aug_cost_matrix"], u, v)
+            
+            if provider_u == "WMATA" and provider_v == "RideOn":
+                directions.append({
+                    "instruction": f"Walk from WMATA Stop ({name_u}) to RideOn Stop ({name_v}) (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
+                    "mode": "Transfer"
+                })
+            elif provider_u == "RideOn" and provider_v == "WMATA":
+                directions.append({
+                    "instruction": f"Walk from RideOn Stop ({name_u}) to WMATA Stop ({name_v}) (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
+                    "mode": "Transfer"
+                })
+            elif mode_u == "Road" and mode_v == "Rail":
+                directions.append({
+                    "instruction": f"Walk into {name_v} Station and board the Metrorail (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
+                    "mode": "Transfer"
+                })
+            elif mode_u == "Rail" and mode_v == "Road":
+                directions.append({
+                    "instruction": f"Exit {name_u} Station and proceed on foot (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
+                    "mode": "Transfer"
+                })
+            else:
+                directions.append({
+                    "instruction": f"Transfer at {name_u} Station hub (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
+                    "mode": "Transfer"
+                })
+        
+        start_name = graph["aug_names"][indices[0]]
+        end_name = graph["aug_names"][indices[-1]]
+        
+        leg_dist = 0.0
+        for i in range(len(indices)-1):
+            u, v = indices[i], indices[i+1]
+            lat_u, lon_u = graph["aug_coords"][u]
+            lat_v, lon_v = graph["aug_coords"][v]
+            dlat = math.radians(lat_v - lat_u)
+            dlon = math.radians(lon_v - lon_u)
+            lat_mid = math.radians((lat_u + lat_v) / 2.0)
+            leg_dist += math.sqrt(dlat**2 + (math.cos(lat_mid) * dlon)**2) * 6371000.0
+        
+        leg_dist_miles = round(leg_dist / 1609.34, 2)
+        
+        if mode == "Road":
+            if is_bridge:
+                directions.append({
+                    "instruction": f"Dispatch shuttle vehicle along optimized street corridor ({start_name.split(' & ')[0]} ➔ {end_name.split(' & ')[0]}) for {leg_dist_miles} miles.",
+                    "mode": "Road"
+                })
+            else:
+                if leg_dist_miles > 0.05:
+                    directions.append({
+                        "instruction": f"Travel along street network ({start_name.split(' & ')[0]} ➔ {end_name.split(' & ')[0]}) for {leg_dist_miles} miles.",
+                        "mode": "Road"
+                    })
+                else:
+                    directions.append({
+                        "instruction": "Proceed along local street grid.",
+                        "mode": "Road"
+                    })
+        elif mode == "Rail":
+            if is_bridge:
+                directions.append({
+                    "instruction": f"Leverage clear subterranean rail path between {start_name} and {end_name} for {leg_dist_miles} miles.",
+                    "mode": "Rail"
+                })
+            else:
+                line_code = get_line_code(start_name, graph["aug_names"][indices[1]] if len(indices) > 1 else start_name, graph["metro_tunnels"])
+                line_display = line_code if line_code else "Metrorail"
+                num_stations = len(indices) - 1
+                directions.append({
+                    "instruction": f"Ride the {line_display} Line {num_stations} stations from {start_name} to {end_name}.",
+                    "mode": "Rail",
+                    "line": line_code
+                })
+                
+    modes_breakdown = {"Road": 0.0, "Rail": 0.0, "Transfer": 0.0}
+    for i in range(len(path)-1):
+        u, v = path[i], path[i+1]
+        m_u = graph["aug_modes"][u]
+        m_v = graph["aug_modes"][v]
+        cost_val = lookup_cost(graph["aug_cost_matrix"], u, v)
+        if m_u != m_v:
+            modes_breakdown["Transfer"] += cost_val
+        else:
+            modes_breakdown[m_u] += cost_val
+            
+    telemetry = {
+        "estimated_time_sec": round(friction_time_sec, 1),
+        "baseline_time_sec": round(baseline_time_sec, 1),
+        "delay_exposure_pct": round(delay_exposure_pct, 1),
+        "stress_avoided_sec": round(stress_avoided_sec, 1),
+        "modes": {
+            "Road": round(modes_breakdown["Road"], 1),
+            "Rail": round(modes_breakdown["Rail"], 1),
+            "Transfer": round(modes_breakdown["Transfer"], 1)
+        }
+    }
+    
+    return {
+        "route": route_points,
+        "telemetry": telemetry,
+        "directions": directions
+    }
+
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
@@ -295,12 +563,111 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Expires', '0')
         super().end_headers()
 
-    def do_POST(self):
-        import json
-        import os
+    def handle_error(self, exc, status_code=500, client_message="Internal server error"):
+        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+        try:
+            with open("server.log", "a") as f:
+                f.write(f"[{timestamp}] Exception caught (status={status_code}): {str(exc)}\n")
+                traceback.print_exc(file=f)
+        except Exception:
+            pass
+        
+        try:
+            self.send_response(status_code)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "error", "message": client_message}).encode('utf-8'))
+        except Exception:
+            pass
 
-        if self.path == '/api/inject':
+    def is_authorized(self):
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+        else:
+            token = ""
+        
+        api_key = os.environ.get("XRAY_API_KEY")
+        if api_key is None:
             try:
+                timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                with open("server.log", "a") as f:
+                    f.write(f"[{timestamp}] WARNING: XRAY_API_KEY environment variable is not defined.\n")
+            except Exception:
+                pass
+            return False
+        
+        return hmac.compare_digest(token, api_key)
+
+    def do_GET(self):
+        try:
+            parsed_url = urllib.parse.urlparse(self.path)
+            path = urllib.parse.unquote(parsed_url.path)
+            
+            # Strict traversal check
+            if ".." in path or "\\" in path:
+                self.send_response(404)
+                self.end_headers()
+                return
+            
+            # Normalize path
+            normalized_path = posixpath.normpath(path)
+            if normalized_path.startswith("..") or "/.." in normalized_path or "..\\" in normalized_path:
+                self.send_response(404)
+                self.end_headers()
+                return
+            
+            # Favicon fallback
+            if normalized_path == "/favicon.ico":
+                favicon_path = os.path.join(DIRECTORY, "favicon.ico")
+                if not os.path.exists(favicon_path):
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'image/x-icon')
+                    self.send_header('Cache-Control', 'public, max-age=86400')
+                    self.end_headers()
+                    self.wfile.write(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82\'')
+                    return
+            
+            # Whitelist validation
+            is_whitelisted = (
+                normalized_path in ["/", "/index.html", "/buses.html", "/trains.html", "/favicon.ico"] or
+                normalized_path.startswith("/static/")
+            )
+            if not is_whitelisted:
+                self.send_response(404)
+                self.end_headers()
+                return
+            
+            # If under /static/, check if it's a physical file
+            if normalized_path.startswith("/static/"):
+                local_path = os.path.join(DIRECTORY, normalized_path.lstrip("/"))
+                if not os.path.isfile(local_path):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+            
+            # Safe root rewrite: rewrite / to /index.html while keeping query string
+            if normalized_path == "/":
+                self.path = "/index.html" + ("?" + parsed_url.query if parsed_url.query else "")
+            
+            super().do_GET()
+        except Exception as e:
+            self.handle_error(e)
+
+    def do_POST(self):
+        try:
+            ip = "127.0.0.1"
+            if hasattr(self, "client_address") and self.client_address:
+                ip = self.client_address[0]
+                
+            if self.path == '/api/inject':
+                if not self.is_authorized():
+                    self.send_response(401)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "message": "Unauthorized"}).encode('utf-8'))
+                    return
+                    
                 content_length = int(self.headers.get('Content-Length', 0))
                 post_data = self.rfile.read(content_length)
                 payload = json.loads(post_data.decode('utf-8'))
@@ -308,16 +675,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 
                 if node_id:
                     sim_file = "sim_state.json"
-                    injected = []
-                    if os.path.exists(sim_file):
-                        try:
-                            with open(sim_file, "r") as f:
-                                injected = json.load(f).get("injected_nodes", [])
-                        except: pass
-                    if node_id not in injected:
-                        injected.append(node_id)
-                        with open(sim_file, "w") as f:
-                            json.dump({"injected_nodes": injected}, f)
+                    lock_file = "sim_state.lock"
+                    with _sim_lock:
+                        with file_lock(lock_file):
+                            injected = []
+                            if os.path.exists(sim_file):
+                                try:
+                                    with open(sim_file, "r") as f:
+                                        injected = json.load(f).get("injected_nodes", [])
+                                except (OSError, json.JSONDecodeError) as e:
+                                    print(f"⚠️ Warning: Failed to read sim_state.json: {e}", file=sys.stderr)
+                            if node_id not in injected:
+                                injected.append(node_id)
+                                tmp_file = sim_file + ".tmp"
+                                try:
+                                    with open(tmp_file, "w") as f:
+                                        json.dump({"injected_nodes": injected}, f)
+                                        f.flush()
+                                        os.fsync(f.fileno())
+                                    os.replace(tmp_file, sim_file)
+                                except OSError as e:
+                                    print(f"⚠️ Warning: Failed to write sim_state.json atomically: {e}", file=sys.stderr)
                     
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
@@ -330,46 +708,76 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(json.dumps({"status": "error", "message": "Missing node_id"}).encode('utf-8'))
                     return
-            except Exception as e:
-                self.send_response(500)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
-                return
-                
-        elif self.path == '/api/clear':
-            try:
+                    
+            elif self.path == '/api/clear':
+                if not self.is_authorized():
+                    self.send_response(401)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "message": "Unauthorized"}).encode('utf-8'))
+                    return
+                    
                 sim_file = "sim_state.json"
-                if os.path.exists(sim_file):
-                    os.remove(sim_file)
+                lock_file = "sim_state.lock"
+                with _sim_lock:
+                    with file_lock(lock_file):
+                        if os.path.exists(sim_file):
+                            try:
+                                os.remove(sim_file)
+                            except OSError as e:
+                                print(f"⚠️ Warning: Failed to remove sim_state.json: {e}", file=sys.stderr)
+                        
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"status": "success", "message": "Simulations cleared"}).encode('utf-8'))
                 return
-            except Exception as e:
-                self.send_response(500)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
-                return
-
-        elif self.path == '/api/route':
-            try:
+                
+            elif self.path == '/api/route':
+                if not check_rate_limit(ip):
+                    self.send_response(429)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "message": "Too many requests"}).encode('utf-8'))
+                    return
+                    
                 content_length = int(self.headers.get('Content-Length', 0))
                 post_data = self.rfile.read(content_length)
-                payload = json.loads(post_data.decode('utf-8'))
+                try:
+                    payload = json.loads(post_data.decode('utf-8'))
+                except json.JSONDecodeError as e:
+                    self.handle_error(e, status_code=400, client_message="Invalid JSON payload")
+                    return
                 
-                start_lat = float(payload.get('start_lat', 0.0))
-                start_lon = float(payload.get('start_lon', 0.0))
-                end_lat = float(payload.get('end_lat', 0.0))
-                end_lon = float(payload.get('end_lon', 0.0))
+                start_lat_raw = payload.get('start_lat')
+                start_lon_raw = payload.get('start_lon')
+                end_lat_raw = payload.get('end_lat')
+                end_lon_raw = payload.get('end_lon')
                 
-                if not (start_lat and start_lon and end_lat and end_lon):
+                if start_lat_raw is None or start_lon_raw is None or end_lat_raw is None or end_lon_raw is None:
                     self.send_response(400)
                     self.send_header('Content-Type', 'application/json')
                     self.end_headers()
                     self.wfile.write(json.dumps({"status": "error", "message": "Missing coordinates"}).encode('utf-8'))
+                    return
+                
+                try:
+                    start_lat = float(start_lat_raw)
+                    start_lon = float(start_lon_raw)
+                    end_lat = float(end_lat_raw)
+                    end_lon = float(end_lon_raw)
+                except (ValueError, TypeError):
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "message": "Malformed coordinate parameters"}).encode('utf-8'))
+                    return
+                
+                if not (validate_coordinates(start_lat, start_lon) and validate_coordinates(end_lat, end_lon)):
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "message": "Coordinates out of DMV bounds"}).encode('utf-8'))
                     return
                 
                 graph = load_and_augment_graph()
@@ -393,237 +801,36 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 dist_sq_e = dlat_e**2 + (np.cos(np.radians(end_lat)) * dlon_e)**2
                 end_idx = int(np.argmin(dist_sq_e))
                 
-                # Dijkstra Stressed Cost Routing
-                dist_matrix, predecessors = dijkstra(
-                    graph["aug_cost_matrix"],
-                    directed=False,
-                    indices=start_idx,
-                    return_predecessors=True
-                )
-                
-                if dist_matrix[end_idx] == np.inf:
+                try:
+                    res = _compute_route(graph, start_idx, end_idx, is_bridge=False)
+                except ValueError as ve:
                     self.send_response(404)
                     self.send_header('Content-Type', 'application/json')
                     self.end_headers()
-                    self.wfile.write(json.dumps({"status": "error", "message": "No path found between selected coordinates."}).encode('utf-8'))
+                    self.wfile.write(json.dumps({"status": "error", "message": str(ve)}).encode('utf-8'))
                     return
-                
-                # Path reconstruction
-                path = []
-                curr = end_idx
-                while curr != start_idx and curr >= 0:
-                    path.append(curr)
-                    curr = predecessors[curr]
-                if curr == start_idx:
-                    path.append(start_idx)
-                    path.reverse()
-                else:
-                    self.send_response(404)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"status": "error", "message": "Reconstruction failed."}).encode('utf-8'))
-                    return
-                
-                # Baseline Clear Dijkstra
-                clear_dist_matrix, clear_predecessors = dijkstra(
-                    graph["aug_clear_cost_matrix"],
-                    directed=False,
-                    indices=start_idx,
-                    return_predecessors=True
-                )
-                
-                clear_path = []
-                curr_c = end_idx
-                while curr_c != start_idx and curr_c >= 0:
-                    clear_path.append(curr_c)
-                    curr_c = clear_predecessors[curr_c]
-                if curr_c == start_idx:
-                    clear_path.append(start_idx)
-                    clear_path.reverse()
-                
-                friction_time_sec = float(dist_matrix[end_idx])
-                baseline_time_sec = float(clear_dist_matrix[end_idx])
-                
-                stressed_baseline_cost = get_path_cost(clear_path, graph["aug_cost_matrix"])
-                stress_avoided_sec = max(0.0, stressed_baseline_cost - friction_time_sec)
-                
-                num_nodes_path = len(path)
-                jammed_nodes_count = sum(1 for node in path if node < N_street and graph["node_friction"][node] < 0.5)
-                delay_exposure_pct = float((jammed_nodes_count / max(1, num_nodes_path)) * 100.0)
-                
-                route_points = []
-                directions = []
-                legs = []
-                curr_leg = None
-                
-                for idx in path:
-                    mode = graph["aug_modes"][idx]
-                    lat_c, lon_c = graph["aug_coords"][idx]
-                    name_c = graph["aug_names"][idx]
-                    
-                    point_info = {
-                        "lat": float(lat_c),
-                        "lon": float(lon_c),
-                        "name": name_c,
-                        "mode": mode,
-                        "node_idx": int(idx)
-                    }
-                    route_points.append(point_info)
-                    
-                    node_id = graph["nodes"][idx] if idx < N_street else ""
-                    provider = "WMATA" if node_id.startswith("wmata_") else "RideOn" if node_id.startswith("rideon_") else "Rail"
-                    
-                    if not curr_leg:
-                        curr_leg = {"mode": mode, "provider": provider, "indices": [idx]}
-                    else:
-                        if curr_leg["mode"] == mode and curr_leg["provider"] == provider:
-                            curr_leg["indices"].append(idx)
-                        else:
-                            legs.append(curr_leg)
-                            curr_leg = {"mode": mode, "provider": provider, "indices": [idx]}
-                if curr_leg:
-                    legs.append(curr_leg)
-                    
-                for idx_leg, leg in enumerate(legs):
-                    mode = leg["mode"]
-                    provider = leg["provider"]
-                    indices = leg["indices"]
-                    
-                    if idx_leg > 0:
-                        prev_leg = legs[idx_leg-1]
-                        u = prev_leg["indices"][-1]
-                        v = indices[0]
-                        mode_u = graph["aug_modes"][u]
-                        mode_v = graph["aug_modes"][v]
-                        name_u = graph["aug_names"][u]
-                        name_v = graph["aug_names"][v]
-                        provider_u = prev_leg["provider"]
-                        provider_v = provider
-                        
-                        # Calculate geodesic distance
-                        lat_u, lon_u = graph["aug_coords"][u]
-                        lat_v, lon_v = graph["aug_coords"][v]
-                        dlat = math.radians(lat_v - lat_u)
-                        dlon = math.radians(lon_v - lon_u)
-                        lat_mid = math.radians((lat_u + lat_v) / 2.0)
-                        dist_m = math.sqrt(dlat**2 + (math.cos(lat_mid) * dlon)**2) * 6371000.0
-                        
-                        # Lookup transfer time
-                        transfer_time_sec = lookup_cost(graph["aug_cost_matrix"], u, v)
-                        
-                        if provider_u == "WMATA" and provider_v == "RideOn":
-                            directions.append({
-                                "instruction": f"Walk from WMATA Stop ({name_u}) to RideOn Stop ({name_v}) (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
-                                "mode": "Transfer"
-                            })
-                        elif provider_u == "RideOn" and provider_v == "WMATA":
-                            directions.append({
-                                "instruction": f"Walk from RideOn Stop ({name_u}) to WMATA Stop ({name_v}) (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
-                                "mode": "Transfer"
-                            })
-                        elif mode_u == "Road" and mode_v == "Rail":
-                            directions.append({
-                                "instruction": f"Walk into {name_v} Station and board the Metrorail (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
-                                "mode": "Transfer"
-                            })
-                        elif mode_u == "Rail" and mode_v == "Road":
-                            directions.append({
-                                "instruction": f"Exit {name_u} Station and proceed on foot (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
-                                "mode": "Transfer"
-                            })
-                        else:
-                            directions.append({
-                                "instruction": f"Transfer at {name_u} Station hub (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
-                                "mode": "Transfer"
-                            })
-                    
-                    if mode == "Road":
-                        start_name = graph["aug_names"][indices[0]]
-                        end_name = graph["aug_names"][indices[-1]]
-                        
-                        leg_dist = 0.0
-                        for i in range(len(indices)-1):
-                            u, v = indices[i], indices[i+1]
-                            lat_u, lon_u = graph["aug_coords"][u]
-                            lat_v, lon_v = graph["aug_coords"][v]
-                            dlat = math.radians(lat_v - lat_u)
-                            dlon = math.radians(lon_v - lon_u)
-                            lat_mid = math.radians((lat_u + lat_v) / 2.0)
-                            leg_dist += math.sqrt(dlat**2 + (math.cos(lat_mid) * dlon)**2) * 6371000.0
-                        
-                        leg_dist_miles = round(leg_dist / 1609.34, 2)
-                        
-                        if leg_dist_miles > 0.05:
-                            directions.append({
-                                "instruction": f"Travel along street network ({start_name.split(' & ')[0]} ➔ {end_name.split(' & ')[0]}) for {leg_dist_miles} miles.",
-                                "mode": "Road"
-                            })
-                        else:
-                            directions.append({
-                                "instruction": "Proceed along local street grid.",
-                                "mode": "Road"
-                            })
-                            
-                    elif mode == "Rail":
-                        start_name = graph["aug_names"][indices[0]]
-                        end_name = graph["aug_names"][indices[-1]]
-                        
-                        line_code = get_line_code(start_name, graph["aug_names"][indices[1]] if len(indices) > 1 else start_name, graph["metro_tunnels"])
-                        line_display = line_code if line_code else "Metrorail"
-                        
-                        num_stations = len(indices) - 1
-                        directions.append({
-                            "instruction": f"Ride the {line_display} Line {num_stations} stations from {start_name} to {end_name}.",
-                            "mode": "Rail",
-                            "line": line_code
-                        })
-                                
-                modes_breakdown = {"Road": 0.0, "Rail": 0.0, "Transfer": 0.0}
-                for i in range(len(path)-1):
-                    u, v = path[i], path[i+1]
-                    m_u = graph["aug_modes"][u]
-                    m_v = graph["aug_modes"][v]
-                    cost_val = lookup_cost(graph["aug_cost_matrix"], u, v)
-                    if m_u != m_v:
-                        modes_breakdown["Transfer"] += cost_val
-                    else:
-                        modes_breakdown[m_u] += cost_val
-                    
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
                 
                 resp_payload = {
                   "status": "success",
-                  "route": route_points,
-                  "telemetry": {
-                    "estimated_time_sec": round(friction_time_sec, 1),
-                    "baseline_time_sec": round(baseline_time_sec, 1),
-                    "delay_exposure_pct": round(delay_exposure_pct, 1),
-                    "stress_avoided_sec": round(stress_avoided_sec, 1),
-                    "modes": {
-                      "Road": round(modes_breakdown["Road"], 1),
-                      "Rail": round(modes_breakdown["Rail"], 1),
-                      "Transfer": round(modes_breakdown["Transfer"], 1)
-                    }
-                  },
-                  "directions": directions
+                  "route": res["route"],
+                  "telemetry": res["telemetry"],
+                  "directions": res["directions"]
                 }
                 
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
                 self.wfile.write(json.dumps(resp_payload).encode('utf-8'))
                 return
                 
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                self.send_response(500)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
-                return
-                
-        elif self.path == '/api/bridge':
-            try:
+            elif self.path == '/api/bridge':
+                if not check_rate_limit(ip):
+                    self.send_response(429)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "message": "Too many requests"}).encode('utf-8'))
+                    return
+                    
                 graph = load_and_augment_graph()
                 if not graph:
                     self.send_response(500)
@@ -690,192 +897,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 v_star = int(v2_hubs_idx[v_idx_local])
                 geodesic_dist = float(dist_matrix[u_idx_local, v_idx_local])
                 
-                dist_matrix_dijkstra, predecessors = dijkstra(
-                    graph["aug_cost_matrix"],
-                    directed=False,
-                    indices=u_star,
-                    return_predecessors=True
-                )
-                
-                if dist_matrix_dijkstra[v_star] == np.inf:
+                try:
+                    res = _compute_route(graph, u_star, v_star, is_bridge=True)
+                except ValueError as ve:
                     self.send_response(404)
                     self.send_header('Content-Type', 'application/json')
                     self.end_headers()
-                    self.wfile.write(json.dumps({"status": "error", "message": "No routing path found between Snapped Hubs"}).encode('utf-8'))
+                    self.wfile.write(json.dumps({"status": "error", "message": str(ve)}).encode('utf-8'))
                     return
-                
-                path = []
-                curr = v_star
-                while curr != u_star and curr >= 0:
-                    path.append(curr)
-                    curr = predecessors[curr]
-                if curr == u_star:
-                    path.append(u_star)
-                    path.reverse()
-                else:
-                    self.send_response(404)
-                    self.send_header('Content-Type', 'application/json')
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"status": "error", "message": "Path reconstruction failed."}).encode('utf-8'))
-                    return
-                
-                clear_dist_matrix, clear_predecessors = dijkstra(
-                    graph["aug_clear_cost_matrix"],
-                    directed=False,
-                    indices=u_star,
-                    return_predecessors=True
-                )
-                
-                clear_path = []
-                curr_c = v_star
-                while curr_c != u_star and curr_c >= 0:
-                    clear_path.append(curr_c)
-                    curr_c = clear_predecessors[curr_c]
-                if curr_c == u_star:
-                    clear_path.append(u_star)
-                    clear_path.reverse()
-                
-                friction_time_sec = float(dist_matrix_dijkstra[v_star])
-                baseline_time_sec = float(clear_dist_matrix[v_star])
-                
-                stressed_baseline_cost = get_path_cost(clear_path, graph["aug_cost_matrix"])
-                stress_avoided_sec = max(0.0, stressed_baseline_cost - friction_time_sec)
-                
-                num_nodes_path = len(path)
-                jammed_nodes_count = sum(1 for node in path if node < N_street and graph["node_friction"][node] < 0.5)
-                delay_exposure_pct = float((jammed_nodes_count / max(1, num_nodes_path)) * 100.0)
-                
-                route_points = []
-                directions = []
-                legs = []
-                curr_leg = None
-                
-                for idx in path:
-                    mode = graph["aug_modes"][idx]
-                    lat_c, lon_c = graph["aug_coords"][idx]
-                    name_c = graph["aug_names"][idx]
-                    
-                    point_info = {
-                        "lat": float(lat_c),
-                        "lon": float(lon_c),
-                        "name": name_c,
-                        "mode": mode,
-                        "node_idx": int(idx)
-                    }
-                    route_points.append(point_info)
-                    
-                    node_id = graph["nodes"][idx] if idx < N_street else ""
-                    provider = "WMATA" if node_id.startswith("wmata_") else "RideOn" if node_id.startswith("rideon_") else "Rail"
-                    
-                    if not curr_leg:
-                        curr_leg = {"mode": mode, "provider": provider, "indices": [idx]}
-                    else:
-                        if curr_leg["mode"] == mode and curr_leg["provider"] == provider:
-                            curr_leg["indices"].append(idx)
-                        else:
-                            legs.append(curr_leg)
-                            curr_leg = {"mode": mode, "provider": provider, "indices": [idx]}
-                if curr_leg:
-                    legs.append(curr_leg)
-                
-                directions.append({
-                    "instruction": f"ESTABLISHED EMERGENCY SHUTTLE BRIDGE between partition hubs: {graph['aug_names'][u_star]} and {graph['aug_names'][v_star]}.",
-                    "mode": "Shuttle"
-                })
-                
-                for idx_leg, leg in enumerate(legs):
-                    mode = leg["mode"]
-                    provider = leg["provider"]
-                    indices = leg["indices"]
-                    
-                    if idx_leg > 0:
-                        prev_leg = legs[idx_leg-1]
-                        u = prev_leg["indices"][-1]
-                        v = indices[0]
-                        mode_u = graph["aug_modes"][u]
-                        mode_v = graph["aug_modes"][v]
-                        name_u = graph["aug_names"][u]
-                        name_v = graph["aug_names"][v]
-                        provider_u = prev_leg["provider"]
-                        provider_v = provider
-                        
-                        # Calculate geodesic distance
-                        lat_u, lon_u = graph["aug_coords"][u]
-                        lat_v, lon_v = graph["aug_coords"][v]
-                        dlat = math.radians(lat_v - lat_u)
-                        dlon = math.radians(lon_v - lon_u)
-                        lat_mid = math.radians((lat_u + lat_v) / 2.0)
-                        dist_m = math.sqrt(dlat**2 + (math.cos(lat_mid) * dlon)**2) * 6371000.0
-                        
-                        # Lookup transfer time
-                        transfer_time_sec = lookup_cost(graph["aug_cost_matrix"], u, v)
-                        
-                        if provider_u == "WMATA" and provider_v == "RideOn":
-                            directions.append({
-                                "instruction": f"Walk from WMATA Stop ({name_u}) to RideOn Stop ({name_v}) (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
-                                "mode": "Transfer"
-                            })
-                        elif provider_u == "RideOn" and provider_v == "WMATA":
-                            directions.append({
-                                "instruction": f"Walk from RideOn Stop ({name_u}) to WMATA Stop ({name_v}) (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
-                                "mode": "Transfer"
-                            })
-                        elif mode_u == "Road" and mode_v == "Rail":
-                            directions.append({
-                                "instruction": f"Walk into {name_v} Station and board the Metrorail (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
-                                "mode": "Transfer"
-                            })
-                        elif mode_u == "Rail" and mode_v == "Road":
-                            directions.append({
-                                "instruction": f"Exit {name_u} Station and proceed on foot (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
-                                "mode": "Transfer"
-                            })
-                        else:
-                            directions.append({
-                                "instruction": f"Transfer at {name_u} Station hub (Walk Transfer: {dist_m:.1f}m, {transfer_time_sec:.1f}s).",
-                                "mode": "Transfer"
-                            })
-                    
-                    start_name = graph["aug_names"][indices[0]]
-                    end_name = graph["aug_names"][indices[-1]]
-                    
-                    leg_dist = 0.0
-                    for i in range(len(indices)-1):
-                        u, v = indices[i], indices[i+1]
-                        lat_u, lon_u = graph["aug_coords"][u]
-                        lat_v, lon_v = graph["aug_coords"][v]
-                        dlat = math.radians(lat_v - lat_u)
-                        dlon = math.radians(lon_v - lon_u)
-                        lat_mid = math.radians((lat_u + lat_v) / 2.0)
-                        leg_dist += math.sqrt(dlat**2 + (math.cos(lat_mid) * dlon)**2) * 6371000.0
-                    
-                    leg_dist_miles = round(leg_dist / 1609.34, 2)
-                    
-                    if mode == "Road":
-                        directions.append({
-                            "instruction": f"Dispatch shuttle vehicle along optimized street corridor ({start_name.split(' & ')[0]} ➔ {end_name.split(' & ')[0]}) for {leg_dist_miles} miles.",
-                            "mode": "Road"
-                        })
-                    elif mode == "Rail":
-                        directions.append({
-                            "instruction": f"Leverage clear subterranean rail path between {start_name} and {end_name} for {leg_dist_miles} miles.",
-                            "mode": "Rail"
-                        })
-                
-                modes_breakdown = {"Road": 0.0, "Rail": 0.0, "Transfer": 0.0}
-                for i in range(len(path)-1):
-                    u, v = path[i], path[i+1]
-                    m_u = graph["aug_modes"][u]
-                    m_v = graph["aug_modes"][v]
-                    cost_val = lookup_cost(graph["aug_cost_matrix"], u, v)
-                    if m_u != m_v:
-                        modes_breakdown["Transfer"] += cost_val
-                    else:
-                        modes_breakdown[m_u] += cost_val
-                
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
                 
                 resp_payload = {
                   "status": "success",
@@ -894,38 +923,26 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                       "lon": float(graph["aug_coords"][v_star][1])
                   },
                   "geodesic_dist_meters": round(geodesic_dist, 1),
-                  "route": route_points,
-                  "telemetry": {
-                    "estimated_time_sec": round(friction_time_sec, 1),
-                    "baseline_time_sec": round(baseline_time_sec, 1),
-                    "delay_exposure_pct": round(delay_exposure_pct, 1),
-                    "stress_avoided_sec": round(stress_avoided_sec, 1),
-                    "modes": {
-                      "Road": round(modes_breakdown["Road"], 1),
-                      "Rail": round(modes_breakdown["Rail"], 1),
-                      "Transfer": round(modes_breakdown["Transfer"], 1)
-                    }
-                  },
-                  "directions": directions
+                  "route": res["route"],
+                  "telemetry": res["telemetry"],
+                  "directions": res["directions"]
                 }
                 
-                self.wfile.write(json.dumps(resp_payload).encode('utf-8'))
-                return
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                self.send_response(500)
+                self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+                self.wfile.write(json.dumps(resp_payload).encode('utf-8'))
                 return
-        else:
-            self.send_response(404)
-            self.end_headers()
+                
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception as e:
+            self.handle_error(e)
 
 if __name__ == "__main__":
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    with socketserver.ThreadingTCPServer(("", PORT), Handler) as httpd:
         print(f"🚀 DMV X-Ray Dashboard live at http://localhost:{PORT}")
         print("Press Ctrl+C to stop the server.")
         httpd.serve_forever()

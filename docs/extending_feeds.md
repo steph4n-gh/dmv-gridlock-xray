@@ -167,28 +167,80 @@ Since $L \vec{1} = 0$, the smallest eigenvalue is always $\lambda_1 = 0$. The se
 Using SciPy's sparse eigensolver (`scipy.sparse.linalg.eigsh`), the system extracts the first three eigenvalues and eigenvectors:
 
 ```python
-def spectral_analysis(W):
+def spectral_analysis(W, f=None, v0=None):
     n = W.shape[0]
     D_diag = np.array(W.sum(axis=1)).flatten()
     L = sp.diags(D_diag) - W
-    try:
-        # Requesting k=3 lowest eigenvalues (using shift-invert mode 'LM' around sigma=1e-5)
-        evals, evecs = eigsh(L, k=3, which='LM', sigma=1e-5, tol=1e-2, maxiter=500)
-        idx = np.argsort(evals)
+    
+    # Calculate adaptive regularization shift sigma_t
+    if f is not None and len(f) > 0:
+        sigma_t = float(max(1e-5, 1e-3 * np.std(f)))
+    else:
+        sigma_t = 1e-5
         
-        l2 = evals[idx[1]]
-        v2 = evecs[:, idx[1]]
-        spectral_gap = evals[idx[2]] - evals[idx[1]]
+    # Validate v0
+    v0_param = None
+    if v0 is not None and len(v0) == n:
+        v0_param = v0
         
-        return l2, v2, spectral_gap
-    except Exception as e:
-        # Fallback routines if solver fails to converge
+    if n <= 3:
         try:
-            evals, evecs = eigsh(L, k=3, which='SM', tol=1e-1)
+            import scipy.linalg
+            evals, evecs = scipy.linalg.eigh(L.toarray())
+            idx = np.argsort(evals)
+            if n == 3:
+                return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
+            elif n == 2:
+                return evals[idx[1]], evecs[:, idx[1]], evals[idx[1]] - evals[idx[0]]
+            else:
+                return 0.0, np.zeros(n), 0.0
+        except Exception as e:
+            print(f"❌ [Solver Error] Dense eigh fallback failed for n={n}: {e}", file=sys.stderr)
+            return 0.0, np.zeros(n), 0.0
+
+    try:
+        evals, evecs = eigsh(L, k=3, which='LM', sigma=sigma_t, tol=1e-2, maxiter=500, v0=v0_param)
+        idx = np.argsort(evals)
+        return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
+    except ArpackNoConvergence as e:
+        converged_count = len(e.eigenvalues) if hasattr(e, 'eigenvalues') and e.eigenvalues is not None else 0
+        print(f"⚠️ [Solver Warning] Primary shift-invert eigsh (LM, sigma={sigma_t:.6f}) failed to converge. "
+              f"Converged eigenvalues: {converged_count}/3. Attempting fallback (SM)...", file=sys.stderr)
+        try:
+            evals, evecs = eigsh(L, k=3, which='SM', tol=1e-1, v0=v0_param)
             idx = np.argsort(evals)
             return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
-        except:
+        except ArpackNoConvergence as e_fb:
+            fb_converged = len(e_fb.eigenvalues) if hasattr(e_fb, 'eigenvalues') and e_fb.eigenvalues is not None else 0
+            print(f"❌ [Solver Error] Fallback eigsh (SM) also failed to converge. "
+                  f"Converged eigenvalues: {fb_converged}/3. Returning topological fallbacks.", file=sys.stderr)
             return 0.0, np.zeros(n), 0.0
+        except ArpackError as e_fb_ap:
+            print(f"❌ [Solver Error] Fallback eigsh (SM) ARPACK error: {e_fb_ap}. Returning topological fallbacks.", file=sys.stderr)
+            return 0.0, np.zeros(n), 0.0
+        except ValueError as e_fb_val:
+            print(f"❌ [Solver Error] Fallback eigsh (SM) ValueError: {e_fb_val}. Returning topological fallbacks.", file=sys.stderr)
+            return 0.0, np.zeros(n), 0.0
+    except ArpackError as e:
+        print(f"❌ [Solver Error] Primary eigsh (LM) ARPACK error: {e}. Attempting fallback (SM)...", file=sys.stderr)
+        try:
+            evals, evecs = eigsh(L, k=3, which='SM', tol=1e-1, v0=v0_param)
+            idx = np.argsort(evals)
+            return evals[idx[1]], evecs[:, idx[1]], evals[idx[2]] - evals[idx[1]]
+        except ArpackNoConvergence as e_fb:
+            fb_converged = len(e_fb.eigenvalues) if hasattr(e_fb, 'eigenvalues') and e_fb.eigenvalues is not None else 0
+            print(f"❌ [Solver Error] Fallback eigsh (SM) also failed to converge under primary ARPACK error. "
+                  f"Converged eigenvalues: {fb_converged}/3. Returning topological fallbacks.", file=sys.stderr)
+            return 0.0, np.zeros(n), 0.0
+        except Exception as e_fb_all:
+            print(f"❌ [Solver Error] Fallback eigsh (SM) failed under primary ARPACK error: {e_fb_all}. Returning topological fallbacks.", file=sys.stderr)
+            return 0.0, np.zeros(n), 0.0
+    except ValueError as e:
+        print(f"❌ [Solver Error] Primary eigsh (LM) invalid parameters: {e}. Returning topological fallbacks.", file=sys.stderr)
+        return 0.0, np.zeros(n), 0.0
+    except Exception as e:
+        print(f"❌ [Solver Error] General failure in spectral_analysis: {e}. Returning topological fallbacks.", file=sys.stderr)
+        return 0.0, np.zeros(n), 0.0
 ```
 
 ### Network Topology Scaling and Edge Changes
