@@ -95,13 +95,13 @@ The ingestion loop (`engine.py`) collects and synthesizes data from 8 distinct f
 ### Prerequisites
 *   Python 3.10 or higher
 *   A WMATA Developer Key (Register at [developer.wmata.com](https://developer.wmata.com))
-*   Montgomery County RideOn API credentials (`RIDEON_API_KEY` and `RIDEON_CLIENT_ID`)
+*   Montgomery County RideOn API credentials (`RIDEON_API_KEY` and `RIDEON_CLIENT_ID`) for live RideOn feeds; the engine can proceed with WMATA data when RideOn topology is unavailable.
 
 ### 1. Clone & Initialize Environment
 Clone the repository and initialize a Python virtual environment:
 ```bash
-git clone <repository_url>
-cd bustracker
+git clone https://github.com/steph4n-gh/dmv-gridlock-xray.git
+cd dmv-gridlock-xray
 python3 -m venv venv
 source venv/bin/activate
 ```
@@ -113,20 +113,21 @@ pip install -r requirements.txt
 ```
 
 ### 3. Configure API Credentials & Environment Variables
-To enable real-time ingestion of vehicle positions, route delays, and service alerts, you must configure the following environment variables. Export them before running the backend processing engine:
+Set the WMATA key before starting the engine. Set the RideOn variables if you also have credentials for its live feeds:
 *   `WMATA_API_KEY`: Developer key acquired from [developer.wmata.com](https://developer.wmata.com) to access the WMATA GTFS-RT Protobuf streams and Metrobus/Metrorail telemetry APIs.
-*   `RIDEON_API_KEY`: Montgomery County API key to authenticate and query RideOn Bus GPS vehicle positions and trip updates JSON endpoints.
-*   `RIDEON_CLIENT_ID`: Montgomery County Developer Portal client ID required in standard HTTP header payloads alongside `RIDEON_API_KEY`.
+*   `RIDEON_API_KEY`: Montgomery County API key for RideOn vehicle positions and trip updates (optional for a WMATA-only run).
+*   `RIDEON_CLIENT_ID`: Montgomery County client ID used alongside `RIDEON_API_KEY` (optional for a WMATA-only run).
 
 ```bash
 export WMATA_API_KEY="your_developer_key_here"
+# If using the RideOn live feeds:
 export RIDEON_API_KEY="your_rideon_api_key_here"
 export RIDEON_CLIENT_ID="your_rideon_client_id_here"
 ```
 
 ### 4. Automatic Static GTFS Management
 The application manages static GTFS schedule topology automatically on startup. During the initialization phase, the engine checks for the existence of the static GTFS files in:
-*   `gtfs/wmata/`
+*   `gtfs/` (WMATA files)
 *   `gtfs/rideon/`
 
 If these files are missing or incomplete, the application will automatically download, extract, and compile the base topological road and rail graph files. **No manual download or extraction of static GTFS ZIP archives is required.**
